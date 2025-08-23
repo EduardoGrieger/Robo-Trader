@@ -1,0 +1,155 @@
+{
+  "capital_conta": 50000,
+  "exposicao_maxima_percentual": 1.0,
+  "limite_loss_dia_percentual": 5.0,
+  "limite_loss_dia_consecutivos": 3,
+  "max_drawdown_diario": 0.05,
+  "max_drawdown_total": 0.1,
+  "risco_por_trade_percentual": 1.0,
+
+  "volume_padrao": 0.2,
+  "volumes": {
+    "EURUSD": 0.2,
+    "GBPUSD": 0.2
+  },
+
+  "modelos_sinal": {
+    "random_forest": { "ativo": true },
+    "xgboost":       { "ativo": true },
+    "lstm":          { "ativo": true }
+  },
+  "ensemble_voting": "media",
+
+  "sl_pips": 20,
+  "tp_pips": 40,
+
+  "usar_modo_simulado": false,
+  "ativos": ["EURUSD", "GBPUSD"],
+  "timeframes": {
+    "EURUSD": "M5",
+    "GBPUSD": "M5"
+  },
+  "janela_candles": 20000,
+  "intervalo_execucao_minutos": 5,
+  "modo_operacao": "hibrido",
+  "risco_retorno": "dinamico",
+
+  "janela_regime": 30,
+  "regime_use_logret": false,
+  "regime_weights": { "media": 1.0, "vol": 3.0 },
+  "regime_hysterese_min_streak": 2,
+  "regime_use_ewma": false,
+  "regime_ewma_span": 10,
+
+  "contexto_min_candles": 100,
+  "contexto_vol_window": 20,
+  "contexto_vol_ref_window": 200,
+  "contexto_volume_window": 20,
+  "contexto_volume_multiplier": 1.5,
+  "squeeze_bandwidth_factor": 0.005,
+
+  "infer_volatility_high_ratio": 1.5,
+  "infer_volatility_med_ratio": 0.9,
+  "infer_volume_high_ratio": 1.5,
+  "infer_volume_med_ratio": 1.05,
+  "trend_flat_threshold": 0.002,
+
+  "horarios_operacao": [
+    { "inicio": "00:00", "fim": "17:00" },
+    { "inicio": "17:30", "fim": "23:59" }
+  ],
+  "meta_gain_mes": 10.0,
+  "meta_loss_dia": -2.0,
+  "pausar_feriado": true,
+  "alerta_mercado_fechado_intervalo_padrao": 120,
+  "alerta_mercado_fechado_intervalo_proximo": 5,
+  "alerta_mercado_fechado_intervalo_final": 1,
+  "fechamento_sexta_automatico": true,
+  "intervalo_reconexao_mt5_min": 5,
+
+  "limiar_score_padrao": 0.0,
+  "peso_score_padrao": 0.7,
+  "peso_score_memoria": 0.3,
+
+  "n_clusters_regime": 3,
+  "n_states_hmm": 3,
+
+  "pip_factors": {
+    "EURUSD": 0.0001,
+    "GBPUSD": 0.0001,
+    "USDJPY": 0.01,
+    "BTCUSD": 0.01
+  },
+
+  "anti_neutro": true,
+  "anti_neutro_threshold": 0.5,
+  "anti_neutro_margin": 0.03,
+  "neutro_weight": 0.4,
+  "xgb_neutro_cap": 0.65,
+
+  "label_params": {
+    "tp_pips": 40,
+    "sl_pips": 20,
+    "janela": 20,
+    "EURUSD": { "tp_pips": 40, "sl_pips": 20, "janela": 20 },
+    "GBPUSD": { "tp_pips": 40, "sl_pips": 20, "janela": 20 }
+  },
+
+  "backup_em_cada_ciclo": false,
+  "promover_modelos_apos_retreino": true,
+
+  "min_evid_padroes": 20,
+  "tp_sl_block_confidence": 0.6,
+  "tp_sl_penalty": 0.1,
+
+  "telegram_token": "7543832672:AAFUvASL5zTyOxe1SmlTUKzsM1VCFAPJjxQ",
+  "telegram_chat_id": "1201417203",
+  "telegram_disable_web_preview": true,
+  "telegram_max_retries": 2,
+  "telegram_timeout_sec": 8,
+  "telegram_poll_timeout_sec": 5,
+  "telegram_allowed_users": ["1201417203"],
+
+  "sniper_rsi_low": 30,
+  "sniper_rsi_high": 70,
+  "sniper_rsi_period": 14,
+  "sniper_requires_no_squeeze": false,
+  "sniper_min_volatility": "baixa",
+  "sniper_require_regime": "",
+
+  "tp_sl_intracandle_priority": "SL",
+
+  "forex_open_utc": "21:00",
+  "forex_close_utc": "21:00",
+
+  "usar_thresholds_walkforward": true,
+  "stale_thresholds_dias": 7,
+  "ensemble_2x1_conf": true,
+  "ensemble_min_conf": 0.7,
+
+  "turbo_override_enable": true,
+  "turbo_override_conf": 0.8,
+  "turbo_requires_no_squeeze": false,
+  "turbo_volume_multiplier": 0.5,
+
+  "sniper_scoring_enable": true,
+  "sniper_score_weights": { "tendencia": 1.0, "vol_ok": 1.0, "no_squeeze": 1.0, "spread_ok": 1.0 },
+  "sniper_score_trade_min": 2,
+  "sniper_score_microlote_if_one": true,
+  "sniper_score_gate_enable": true,
+
+  "regime_threshold_adjust_trend": 0.03,
+  "class_weight_updown": 4.0,
+
+  "ev_rule_enable": true,
+  "ev_min_pips": 0.5,
+
+  "lote_adaptativo_enable": true,
+  "lote_adaptativo_breakpoints": {
+    "hi": 0.85,
+    "mid": 0.65,
+    "mult_hi": 1.5,
+    "mult_mid": 0.75,
+    "mult_low": 0.25
+  }
+}
