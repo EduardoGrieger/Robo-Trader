@@ -21,23 +21,42 @@ def _motivo_lote_from_return(res: dict) -> str:
     except Exception:
         return "lote_teorico"
 
+def _sf(x, default=None):
+    """safe-float: lida com None e strings com vírgula."""
+    try:
+        return float(x)
+    except Exception:
+        try:
+            return float(str(x).replace(",", "."))
+        except Exception:
+            return default
+
 try:
-    # Usa o cálculo institucional centralizado (com piso/teto + logs)
+    # Usa o cálculo institucional centralizado (com piso/teto + logs).
     from utils.lote_adaptativo import calcular_lote_adaptativo as _calc_lote_central
 
     def calcular_lote_adaptativo(ativo, contexto=None):
-        res = _calc_lote_central(ativo=ativo, contexto=contexto, return_all=True)
-        volume = float(res["lote_utilizado"])
-        motivo = _motivo_lote_from_return(res)
-        log_event(f"[LOTE-EXECUTOR] ativo={ativo} volume={volume} motivo={motivo} | detalhes={res}", level="info")
-        return volume, motivo
+        # tenta com return_all=True; se não suportado, chama sem
+        try:
+            res = _calc_lote_central(ativo=ativo, contexto=contexto, return_all=True)
+            volume = float(res["lote_utilizado"])
+            motivo = _motivo_lote_from_return(res)
+            log_event(f"[LOTE-EXECUTOR] ativo={ativo} volume={volume} motivo={motivo} | detalhes={res}", level="info")
+            return volume, motivo
+        except TypeError:
+            volume = float(_calc_lote_central(ativo=ativo, contexto=contexto))
+            log_event(f"[LOTE-EXECUTOR] ativo={ativo} volume={volume} motivo=lote_teorico (sem return_all)", level="info")
+            return volume, "lote_teorico"
+        except Exception as e:
+            log_event(f"[LOTE-EXECUTOR] Erro no cálculo centralizado: {e}", level="warning")
+            raise
 
 except Exception as e:
     # Fallback: usa volume do config se não conseguir importar o módulo central
     log_event(f"[LOTE-EXECUTOR] Fallback para volume do config (erro import lote_adaptativo: {e})", level="warning")
     def calcular_lote_adaptativo(ativo, contexto=None):
         cfg = carregar_config()
-        volume = float(cfg.get("volumes", {}).get(ativo, cfg.get("volume_padrao", 0.01)))
+        volume = _sf(cfg.get("volumes", {}).get(ativo, cfg.get("volume_padrao", 0.01)), 0.01)
         return volume, "fallback_config_volume"
 
 
@@ -193,6 +212,13 @@ def enviar_ordem(tipo, ativo, timestamp, volume=None, sl_pips=None, tp_pips=None
     deviation = int(cfg.get("mt5_deviation", 10))
     magic = int(cfg.get("mt5_magic", 123456))
 
+    # debug do contexto recebido
+    try:
+        if isinstance(contexto, dict) and "confianca" in contexto:
+            log_event(f"[ENVIO ORDEM] contexto recebido com confianca={contexto.get('confianca')}", level="debug")
+    except Exception:
+        pass
+
     lado = str(tipo).strip().lower()
     if lado in ("compra", "buy", "long"):
         lado = "buy"
@@ -206,9 +232,23 @@ def enviar_ordem(tipo, ativo, timestamp, volume=None, sl_pips=None, tp_pips=None
 
     # Volume: se não vier definido, calcula com módulo central (piso/teto + logs)
     if volume is None:
-        volume, motivo_lote = calcular_lote_adaptativo(ativo, contexto)
+        try:
+            volume, motivo_lote = calcular_lote_adaptativo(ativo, contexto)
+        except Exception as e:
+            log_event(f"[ENVIO ORDEM] calcular_lote_adaptativo falhou: {e}", level="warning")
+            # fallback duro: config
+            volume = _sf(cfg.get("volumes", {}).get(ativo, cfg.get("volume_padrao", 0.01)), 0.01)
+            motivo_lote = "fallback_config_volume"
     else:
-        motivo_lote = "Lote recebido externamente."
+        volume = _sf(volume, None)
+        if volume is None or volume <= 0:
+            try:
+                volume, motivo_lote = calcular_lote_adaptativo(ativo, contexto)
+            except Exception:
+                volume = _sf(cfg.get("volumes", {}).get(ativo, cfg.get("volume_padrao", 0.01)), 0.01)
+                motivo_lote = "fallback_config_volume"
+        else:
+            motivo_lote = "lote_recebido_externo"
 
     # SL/TP em pips
     if sl_pips is None or tp_pips is None:
@@ -217,7 +257,7 @@ def enviar_ordem(tipo, ativo, timestamp, volume=None, sl_pips=None, tp_pips=None
         tp_pips = tp_cfg if tp_pips is None else tp_pips
 
     log_event(f"[ENVIO ORDEM] tipo={lado} ativo={ativo} volume={volume} timestamp={timestamp} "
-              f"SL={sl_pips} TP={tp_pips} motivo_lote={motivo_lote}")
+              f"SL={sl_pips} TP={tp_pips} motivo_lote={motivo_lote}", level="info")
 
     # Simulado
     if simulado:
@@ -228,14 +268,19 @@ def enviar_ordem(tipo, ativo, timestamp, volume=None, sl_pips=None, tp_pips=None
             "preco": tick_price,
             "comment": motivo_lote,
             "motivo": "modo_simulado",
-            "diagnostico": {"last_error": None, "symbol_info": None},
+            "diagnostico": {"last_error": None, "symbol_info": None, "volume_enviado": volume},
         }
         sanity_check_ordem(result)
-        log_event(f"[ORDEM SIMULADA] {result}")
+        log_event(f"[ORDEM SIMULADA] {result}", level="info")
         return result
 
     # Real
     if not mt5.initialize():
+        last_err = None
+        try:
+            last_err = mt5.last_error()
+        except Exception:
+            pass
         log_event("erro_conexao_mt5", level="error")
         result = {
             "retcode": "erro",
@@ -243,7 +288,7 @@ def enviar_ordem(tipo, ativo, timestamp, volume=None, sl_pips=None, tp_pips=None
             "preco": None,
             "comment": "init_fail",
             "motivo": "falha_initialize",
-            "diagnostico": {"last_error": mt5.last_error(), "symbol_info": None},
+            "diagnostico": {"last_error": last_err, "symbol_info": None, "volume_enviado": volume},
         }
         sanity_check_ordem(result)
         return result
@@ -273,7 +318,7 @@ def enviar_ordem(tipo, ativo, timestamp, volume=None, sl_pips=None, tp_pips=None
                 "preco": None,
                 "comment": "tick_indisponivel",
                 "motivo": "tick indisponível",
-                "diagnostico": {"last_error": mt5.last_error(), "symbol_info": None},
+                "diagnostico": {"last_error": mt5.last_error(), "symbol_info": None, "volume_enviado": volume},
             }
             sanity_check_ordem(saida)
             log_event(f"[ERRO ENVIO ORDEM] Tick indisponível para {ativo}", level="error")
@@ -322,6 +367,7 @@ def enviar_ordem(tipo, ativo, timestamp, volume=None, sl_pips=None, tp_pips=None
                     "volume_step": getattr(si, "volume_step", None),
                     "volume_max": getattr(si, "volume_max", None),
                 },
+                "volume_enviado": volume,
             }
         except Exception:
             pass
@@ -348,7 +394,7 @@ def enviar_ordem(tipo, ativo, timestamp, volume=None, sl_pips=None, tp_pips=None
             "preco": None,
             "comment": str(e),
             "motivo": "excecao_python",
-            "diagnostico": {"last_error": mt5.last_error(), "symbol_info": None},
+            "diagnostico": {"last_error": mt5.last_error(), "symbol_info": None, "volume_enviado": volume},
         }
         sanity_check_ordem(saida)
         return saida
@@ -367,7 +413,7 @@ def fechar_todas_ordens_abertas(ativo, motivo):
     simulado = cfg.get("usar_modo_simulado", True)
 
     if simulado:
-        log_event(f"[FECHAR TODAS] Simulado ON — nada a fechar para {ativo}.")
+        log_event(f"[FECHAR TODAS] Simulado ON — nada a fechar para {ativo}.", level="info")
         return []
 
     if not mt5.initialize():
@@ -379,7 +425,7 @@ def fechar_todas_ordens_abertas(ativo, motivo):
         fechamentos = []
 
         if not posicoes:
-            log_event(f"nenhuma_ordem_aberta_para_fechar | ativo:{ativo}")
+            log_event(f"nenhuma_ordem_aberta_para_fechar | ativo:{ativo}", level="info")
             return []
 
         for pos in posicoes:
@@ -420,7 +466,7 @@ def fechar_todas_ordens_abertas(ativo, motivo):
                 "data_fechamento": datetime.now(),
             }
             sanity_check_dict(saida, ["ticket", "retcode", "preco_fechamento"])
-            log_event(f"[FECHAMENTO ORDEM] {saida}")
+            log_event(f"[FECHAMENTO ORDEM] {saida}", level="info" if _retcode_sucesso(retcode) else "error")
             fechamentos.append(saida)
 
         return fechamentos
@@ -441,7 +487,7 @@ def fechar_ordem(ticket, ativo):
 
     if simulado:
         saida = {"retcode": "simulada", "ticket": ticket, "preco_fechamento": 0.0, "lucro": 0.0}
-        log_event(f"[FECHAR ORDEM SIMULADA] {saida}")
+        log_event(f"[FECHAR ORDEM SIMULADA] {saida}", level="info")
         return saida
 
     if not mt5.initialize():

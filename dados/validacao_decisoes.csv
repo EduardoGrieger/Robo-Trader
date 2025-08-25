@@ -539,5 +539,17 @@ datahora,ativo,sinal_robo,preco_entrada,padrao,confianca,motivo,sinal_ideal_n1,r
 2025-08-18 20:50:00,GBPUSD,0,1.35093,RandomForest:0|XGBoost:0|LSTM:1,0.77,random_forest:0|Conf:0.62|ConfEff:0.25|xgboost:0|Conf:0.97|ConfEff:0.26|lstm:1|Conf:0.73|ConfEff:0.73|SNIPER:BLOCK|mp=0.589; Score_Reforco=0.0,0,neutro,0.0,False
 2025-08-18 20:55:00,EURUSD,0,1.16628,RandomForest:0|XGBoost:0|LSTM:1,0.76,random_forest:0|Conf:0.82|ConfEff:0.33|xgboost:0|Conf:0.81|ConfEff:0.26|lstm:1|Conf:0.64|ConfEff:0.64|SNIPER:BLOCK|mp=0.519; Score_Reforco=0.0,0,neutro,0.0,False
 2025-08-18 20:55:00,GBPUSD,0,1.35093,RandomForest:0|XGBoost:0|LSTM:1,0.77,random_forest:0|Conf:0.64|ConfEff:0.26|xgboost:0|Conf:0.98|ConfEff:0.26|lstm:1|Conf:0.71|ConfEff:0.71|SNIPER:BLOCK|mp=0.578; Score_Reforco=0.0,0,neutro,0.0,False
-2025-08-21 01:55:00,EURUSD,0,1.16525,RandomForest:0|XGBoost:0|LSTM:1,0.95,random_forest:0|Conf:0.98|ConfEff:0.39|xgboost:0|Conf:1.00|ConfEff:0.26|lstm:1|Conf:0.87|ConfEff:0.87|SNIPER:BLOCK|mp=0.572; Score_Reforco=0.0,,,,True
-2025-08-21 01:55:00,GBPUSD,0,1.3455,RandomForest:0|XGBoost:0|LSTM:1,0.78,random_forest:0|Conf:0.65|ConfEff:0.26|xgboost:0|Conf:0.82|ConfEff:0.26|lstm:1|Conf:0.89|ConfEff:0.89|SNIPER:BLOCK|mp=0.631; Score_Reforco=0.0,,,,True
+2025-08-21 01:55:00,EURUSD,0,1.16525,RandomForest:0|XGBoost:0|LSTM:1,0.95,random_forest:0|Conf:0.98|ConfEff:0.39|xgboost:0|Conf:1.00|ConfEff:0.26|lstm:1|Conf:0.87|ConfEff:0.87|SNIPER:BLOCK|mp=0.572; Score_Reforco=0.0,0,neutro,0.0,False
+2025-08-21 01:55:00,GBPUSD,0,1.3455,RandomForest:0|XGBoost:0|LSTM:1,0.78,random_forest:0|Conf:0.65|ConfEff:0.26|xgboost:0|Conf:0.82|ConfEff:0.26|lstm:1|Conf:0.89|ConfEff:0.89|SNIPER:BLOCK|mp=0.631; Score_Reforco=0.0,0,neutro,0.0,False
+2025-08-22 23:50:00,EURUSD,1,1.17208,,0.7233937502470997,votos=RandomForest:0|XGBoost:1|LSTM:1,0,errou,1.6,False
+2025-08-22 23:50:00,GBPUSD,1,1.35253,,0.7163482251654143,votos=RandomForest:-1|XGBoost:1|LSTM:1,0,errou,-10.1,False
+2025-08-25 00:45:00,EURUSD,1,1.17217,,0.856131588144904,votos=RandomForest:0|XGBoost:1|LSTM:1,0,errou,-0.3,False
+2025-08-25 00:45:00,GBPUSD,1,1.3511,,0.72956705819951,votos=RandomForest:-1|XGBoost:0|LSTM:1,0,errou,2.0,False
+2025-08-25 00:50:00,EURUSD,1,1.17214,,0.8680201483173233,votos=RandomForest:0|XGBoost:1|LSTM:1,0,errou,0.1,False
+2025-08-25 00:50:00,GBPUSD,1,1.3513,,0.6755617179716782,votos=RandomForest:-1|XGBoost:0|LSTM:1,0,errou,-1.8,False
+2025-08-25 03:05:00,EURUSD,1,1.17002,interpretacao,0.7659229796816912,votos=RandomForest:0|XGBoost:1|LSTM:1,0,errou,1.8,False
+2025-08-25 03:05:00,GBPUSD,1,1.35018,interpretacao,0.7813921062396139,votos=RandomForest:0|XGBoost:1|LSTM:1,0,errou,0.5,False
+2025-08-25 03:10:00,EURUSD,1,1.1702,interpretacao,0.7507990071888248,votos=RandomForest:-1|XGBoost:1|LSTM:1,0,errou,-3.2,False
+2025-08-25 03:10:00,GBPUSD,1,1.35023,interpretacao,0.7539501959105562,votos=RandomForest:0|XGBoost:1|LSTM:1,0,errou,-2.1,False
+2025-08-25 03:15:00,EURUSD,1,1.16988,interpretacao,0.7532501894583233,votos=RandomForest:-1|XGBoost:1|LSTM:1,,,,True
+2025-08-25 03:15:00,GBPUSD,1,1.35002,interpretacao,0.7508793628876672,votos=RandomForest:0|XGBoost:1|LSTM:1,,,,True

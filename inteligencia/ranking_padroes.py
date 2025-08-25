@@ -1,7 +1,219 @@
 # inteligencia/ranking_padroes.py
+# -*- coding: utf-8 -*-
+
+"""
+MÓDULO COMBINADO: Detecção + Ranking de Padrões
+
+O que há aqui:
+- DETECÇÃO: rankear(row) -> (padrao: str, score: float em [0..1])
+  Aliases: rankear_padroes, detectar_padrao, calcular_padrao
+  -> Tolerante a valores faltantes; nunca levanta exceção; sempre retorna uma tupla.
+
+- RANKING (placar): atualizar_ranking, exibir_top_padroes, obter_score_padrao, obter_score_e_n
+  -> Mantido 100% compatível com sua versão original.
+
+Motivação:
+- O loop principal estava logando: "[PADRAO] não foi possível calcular: cannot unpack non-iterable float object".
+  Isso acontece quando quem chama faz `padrao, score = ...` mas a função retornava apenas um `float`.
+  Com este arquivo, garantimos contrato estável (sempre (str, float)), evitando None/erros de unpack.
+"""
+
+from __future__ import annotations
+
 import os
+import math
+from typing import Any, Mapping, Tuple, List
+
 import pandas as pd
-from utils.debug_logger import log_event
+
+try:
+    from utils.debug_logger import log_event
+except Exception:
+    # Fallback simples se o util não estiver disponível
+    import logging
+    _fallback_logger = logging.getLogger("ranking_padroes")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    def log_event(msg: str, level: str = "info"):
+        lvl = getattr(_fallback_logger, level if hasattr(_fallback_logger, level) else "info")
+        lvl(msg)
+
+# =====================================================================
+# ------------------------- DETECÇÃO DE PADRÕES -----------------------
+# =====================================================================
+
+def _safe_get(m: Mapping[str, Any], key: str, default: Any = None) -> Any:
+    try:
+        if m is None:
+            return default
+        if hasattr(m, "get"):
+            return m.get(key, default)
+        return m[key]
+    except Exception:
+        return default
+
+
+def _as_float(v: Any, default: float = math.nan) -> float:
+    try:
+        if v is None:
+            return default
+        f = float(v)
+        if math.isnan(f):
+            return default
+        return f
+    except Exception:
+        try:
+            # tenta trocar vírgula por ponto
+            f = float(str(v).replace(",", "."))
+            return f if not math.isnan(f) else default
+        except Exception:
+            return default
+
+
+def _as_bool(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in {"1", "true", "t", "y", "yes", "sim"}
+
+
+def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    if x is None or math.isnan(x):
+        return lo
+    return max(lo, min(hi, float(x)))
+
+
+def rankear(row: Mapping[str, Any]) -> Tuple[str, float]:
+    """
+    Analisa a última linha de dados e retorna (padrao, score∈[0..1]).
+    - Nunca levanta exceção para o chamador.
+    - Sempre retorna uma TUPLA.
+    - Se nada bater, retorna ("sem_padrao", 0.0).
+    """
+    try:
+        if row is None:
+            log_event("[PADRAO] Linha NULA recebida. Retornando fallback.", level="warning")
+            return "sem_padrao", 0.0
+
+        # OHLC
+        o = _as_float(_safe_get(row, "open"))
+        h = _as_float(_safe_get(row, "high"))
+        l = _as_float(_safe_get(row, "low"))
+        c = _as_float(_safe_get(row, "close"))
+
+        if any(math.isnan(x) for x in (o, h, l, c)) or l > h:
+            log_event(f"[PADRAO] OHLC inválido (o={o} h={h} l={l} c={c}). Fallback.", level="warning")
+            return "sem_padrao", 0.0
+
+        rng = max(h - l, 1e-9)
+        body = abs(c - o)
+        body_ratio = body / rng
+
+        # Features auxiliares (podem não existir)
+        squeeze = _as_bool(_safe_get(row, "squeeze"))
+        bb_bw = _as_float(_safe_get(row, "bb_bandwidth"), default=math.nan)
+        up_shadow = _as_float(_safe_get(row, "upper_shadow_ratio"), default=math.nan)
+        low_shadow = _as_float(_safe_get(row, "lower_shadow_ratio"), default=math.nan)
+        body_pos = _as_float(_safe_get(row, "body_position"), default=math.nan)
+        breakout_flag = _as_bool(_safe_get(row, "breakout_adaptive"))
+        bull_eng = _as_bool(_safe_get(row, "bullish_engulfing"))
+        bear_eng = _as_bool(_safe_get(row, "bearish_engulfing"))
+        regime = _safe_get(row, "regime_kmeans", None)
+
+        log_event(
+            "[PADRAO] Base OHLC: "
+            f"o={o:.5f} h={h:.5f} l={l:.5f} c={c:.5f} | rng={rng:.6f} body_ratio={body_ratio:.3f} "
+            f"squeeze={squeeze} bb_bw={'nan' if math.isnan(bb_bw) else f'{bb_bw:.6f}'} "
+            f"up={'nan' if math.isnan(up_shadow) else f'{up_shadow:.3f}'} "
+            f"low={'nan' if math.isnan(low_shadow) else f'{low_shadow:.3f}'} "
+            f"pos={'nan' if math.isnan(body_pos) else f'{body_pos:.3f}'} reg={regime}",
+            level="debug",
+        )
+
+        # Candidatos: (nome, score, tag_debug)
+        candidatos: List[Tuple[str, float, str]] = []
+
+        # 1) Engulfings se já pré-computados nos features
+        if bull_eng:
+            sc = 0.65
+            if squeeze: sc += 0.10
+            if not math.isnan(bb_bw): sc += _clamp((0.002 - bb_bw) / 0.002, 0.0, 0.15)
+            candidatos.append(("bullish_engulfing", _clamp(sc), "flag+squeeze+bw"))
+
+        if bear_eng:
+            sc = 0.65
+            if squeeze: sc += 0.10
+            if not math.isnan(bb_bw): sc += _clamp((0.002 - bb_bw) / 0.002, 0.0, 0.15)
+            candidatos.append(("bearish_engulfing", _clamp(sc), "flag+squeeze+bw"))
+
+        # 2) Inside bar (aproximação: corpo pequeno + compressão)
+        if body_ratio < 0.25 and (squeeze or (not math.isnan(bb_bw) and bb_bw < 0.0012)):
+            sc = 0.55
+            if not math.isnan(bb_bw): sc += _clamp((0.0012 - bb_bw) / 0.0012, 0.0, 0.25)
+            candidatos.append(("inside_bar", _clamp(sc), "small_body+compressao"))
+
+        # 3) Breakout adaptativo
+        if breakout_flag:
+            sc = 0.60
+            if not math.isnan(bb_bw): sc += _clamp((0.0015 - bb_bw) / 0.0015, 0.0, 0.20)
+            candidatos.append(("breakout_adaptive", _clamp(sc), "flag+bw"))
+
+        # 4) Sombra longa — martelo / estrela cadente
+        if not math.isnan(up_shadow) and not math.isnan(low_shadow):
+            if body_ratio < 0.35 and low_shadow > 1.8 and up_shadow < 0.6:
+                sc = 0.58 + (0.07 if squeeze else 0.0)
+                candidatos.append(("hammer", _clamp(sc), "shadow_asym"))
+            if body_ratio < 0.35 and up_shadow > 1.8 and low_shadow < 0.6:
+                sc = 0.58 + (0.07 if squeeze else 0.0)
+                candidatos.append(("shooting_star", _clamp(sc), "shadow_asym"))
+
+        # 5) Compressão geral (squeeze/bandwidth)
+        if squeeze or (not math.isnan(bb_bw) and bb_bw < 0.0009):
+            sc = 0.50
+            if not math.isnan(bb_bw): sc += _clamp((0.0010 - bb_bw) / 0.0010, 0.0, 0.20)
+            candidatos.append(("compressao", _clamp(sc), "squeeze/bw"))
+
+        # Ajuste por regime (quando numérico: 0=lateral, 1=tendência, 2=explosão)
+        try:
+            reg_i = int(regime) if regime is not None else None
+        except Exception:
+            reg_i = None
+
+        if candidatos and reg_i is not None:
+            for i, (nome, sc, tag) in enumerate(candidatos):
+                if nome in ("inside_bar", "compressao") and reg_i == 0:
+                    sc = _clamp(sc + 0.05)
+                if nome in ("breakout_adaptive",) and reg_i in (1, 2):
+                    sc = _clamp(sc + 0.05)
+                candidatos[i] = (nome, sc, f"{tag}+reg{reg_i}")
+
+        # Seleção
+        if candidatos:
+            candidatos.sort(key=lambda t: t[1], reverse=True)
+            melhor = candidatos[0]
+            log_event(
+                f"[PADRAO] Selecionado: {melhor[0]} (score={melhor[1]:.3f}) | "
+                f"candidatos={[(n, round(s,3)) for n, s, _ in candidatos]}",
+                level="info",
+            )
+            return melhor[0], melhor[1]
+
+        log_event("[PADRAO] Nenhum padrão elegível. Retornando ('sem_padrao', 0.0).", level="debug")
+        return "sem_padrao", 0.0
+
+    except Exception as e:
+        # Segurança: nunca propagar
+        log_event(f"[PADRAO] Erro inesperado em rankear(): {e}. Fallback ('sem_padrao', 0.0).", level="error")
+        return "sem_padrao", 0.0
+
+
+# Aliases para compatibilidade (o main_loop pode chamar qualquer um deles)
+rankear_padroes = rankear
+detectar_padrao = rankear
+calcular_padrao = rankear
+
+# =====================================================================
+# --------------------------- RANKING (CSV) ---------------------------
+# =====================================================================
 
 RANKING_PATH = "dados/ranking_padroes.csv"
 COLS = ["ativo", "padrao", "acertos", "erros", "neutros", "total"]
@@ -72,7 +284,6 @@ def atualizar_ranking(ativo, row: dict):
         try:
             lucro = float(lucro_raw)
         except Exception:
-            # se vier string tipo "0.00" ou "None"
             try:
                 lucro = float(str(lucro_raw).replace(",", "."))
             except Exception:
@@ -146,7 +357,7 @@ def obter_score_padrao(padrao, ativo=None) -> float:
 
 def obter_score_e_n(padrao, ativo=None):
     """
-    NOVO: retorna (score, N) do padrão.
+    Retorna (score, N) do padrão.
       - score ∈ [-1, +1]  com score = (acertos - erros) / total
       - N = total de ocorrências
     Se 'ativo' for fornecido, filtra por ativo; senão, usa o consolidado.
@@ -182,8 +393,8 @@ def obter_score_e_n(padrao, ativo=None):
         return 0.0, 0
 
 __all__ = [
-    "atualizar_ranking",
-    "exibir_top_padroes",
-    "obter_score_padrao",
-    "obter_score_e_n",
+    # detecção
+    "rankear", "rankear_padroes", "detectar_padrao", "calcular_padrao",
+    # ranking
+    "atualizar_ranking", "exibir_top_padroes", "obter_score_padrao", "obter_score_e_n",
 ]

@@ -10,9 +10,9 @@ from datetime import datetime
 # Global config placeholder (overwritten later in main)
 cfg = {}
 
-
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
 
 # XGBoost
 try:
@@ -26,7 +26,7 @@ try:
 except ImportError:
     keras = None
 
-# Oversampling e Undersampling
+# Oversampling e Undersampling (opcional; não usamos SMOTE pra evitar vazamento)
 try:
     from imblearn.over_sampling import SMOTE, RandomOverSampler
     from imblearn.under_sampling import RandomUnderSampler
@@ -37,6 +37,8 @@ except ImportError:
 
 from utils.debug_logger import log_event
 
+
+# ========================= UTIL & DIAGNÓSTICOS =========================
 
 def salvar_relatorio(report_str, tag=""):
     os.makedirs("logs", exist_ok=True)
@@ -76,53 +78,132 @@ def carregar_dados(features_path):
     return df
 
 
+# ========================= META-FEATURES DEFENSIVAS =========================
+
+def adicionar_meta_features(df):
+    """
+    Adiciona meta-features SE houver OHLC. É defensivo: se não tiver colunas,
+    segue sem quebrar.
+    """
+    df = df.copy()
+    ok_close = "close" in df.columns
+    ok_h = "high" in df.columns
+    ok_l = "low" in df.columns
+
+    if ok_close:
+        returns = df["close"].pct_change()
+        df["volatility_20"] = returns.rolling(20).std()
+        df["volatility_50"] = returns.rolling(50).std()
+        df["trend_strength"] = df["close"].rolling(20).apply(
+            lambda x: abs(np.polyfit(range(len(x)), x, 1)[0]) / np.std(x) if np.std(x) > 0 else 0,
+            raw=False
+        )
+    if ok_close and ok_h and ok_l:
+        roll_mean = df["close"].rolling(20).mean()
+        df["range_ratio"] = (df["high"] - df["low"]) / roll_mean
+
+    return df
+
+
+# ========================= BALANCEAMENTO =========================
+# (mantemos a versão antiga por compatibilidade, mas NÃO usamos antes do split)
+
 def balancear_labels(X, y, perc_neutro=0.20, min_amostra=150):
-    from collections import Counter
-    counts = Counter(y)
-    n_total = len(y)
-    n_neutro = counts.get(0, 0)
-    n_venda = counts.get(-1, 0)
-    n_compra = counts.get(1, 0)
+    """
+    (Compat) Não usar antes do split. Mantido para não quebrar importações antigas.
+    """
+    rng = np.random.default_rng(42)
+    is_pd_X = hasattr(X, "iloc"); is_pd_y = hasattr(y, "iloc")
+    dfx = X.reset_index(drop=True) if is_pd_X else pd.DataFrame(X)
+    dfy = y.reset_index(drop=True) if is_pd_y else pd.Series(y)
 
-    n_neutro_limite = int(perc_neutro * n_total)
-    n_venda_limite = max(min_amostra, n_venda)
-    n_compra_limite = max(min_amostra, n_compra)
+    idx_neu = dfy[dfy == 0].index.values
+    idx_dn  = dfy[dfy == -1].index.values
+    idx_up  = dfy[dfy ==  1].index.values
 
-    # Neutros: undersample se necessário
-    if n_neutro > n_neutro_limite:
-        idx_neutros = y[y == 0].sample(n=n_neutro_limite, random_state=42).index
-    else:
-        idx_neutros = y[y == 0].index
+    n = len(dfy)
+    max_neu = int(perc_neutro * n)
 
-    # Venda: oversample se necessário
-    idx_venda = y[y == -1].index
-    falta_venda = n_venda_limite - len(idx_venda)
-    if falta_venda > 0 and len(idx_venda) > 0:
-        idx_venda = idx_venda.append(pd.Index(np.random.choice(idx_venda, falta_venda, replace=True)))
+    if len(idx_neu) > max_neu and max_neu > 0:
+        idx_neu = rng.choice(idx_neu, size=max_neu, replace=False)
 
-    # Compra: oversample se necessário
-    idx_compra = y[y == 1].index
-    falta_compra = n_compra_limite - len(idx_compra)
-    if falta_compra > 0 and len(idx_compra) > 0:
-        idx_compra = idx_compra.append(pd.Index(np.random.choice(idx_compra, falta_compra, replace=True)))
+    target = max(len(idx_neu), len(idx_dn), len(idx_up), int(min_amostra))
 
-    idx_usar = idx_neutros.union(idx_venda).union(idx_compra)
-    Xb = X.loc[idx_usar]
-    yb = y.loc[idx_usar]
-    log_event(f"[BALANCEAMENTO] Distribuição pós-balanceamento: {yb.value_counts().to_dict()}")
+    def _oversample(idxs, tgt):
+        if len(idxs) == 0:
+            return np.array([], dtype=int)
+        if len(idxs) >= tgt:
+            return rng.choice(idxs, size=tgt, replace=False)
+        extra = rng.choice(idxs, size=tgt - len(idxs), replace=True)
+        return np.concatenate([idxs, extra])
+
+    idx_dn2 = _oversample(idx_dn, target)
+    idx_up2 = _oversample(idx_up, target)
+
+    keep = np.concatenate([idx_neu, idx_dn2, idx_up2])
+    keep.sort(kind="mergesort")
+    Xb = dfx.loc[keep].reset_index(drop=True)
+    yb = dfy.loc[keep].reset_index(drop=True)
+    log_event(f"[BALANCEAMENTO] Distribuição pós-balanceamento (compat): {yb.value_counts().to_dict()}")
+    return Xb if is_pd_X else Xb.values, yb if is_pd_y else yb.values
+
+
+def balancear_labels_avancado(X, y, max_neutro_ratio=0.25, min_amostras_classe=150, random_state=42):
+    """
+    Balanceia APENAS o conjunto de TREINO:
+      - Corta neutros para no máx. max_neutro_ratio
+      - Oversample em {-1, +1} até min_amostras_classe
+    Não usar antes do split para evitar vazamento entre conjuntos.
+    """
+    from sklearn.utils import resample
+    rng = np.random.RandomState(random_state)
+
+    Xp = X.reset_index(drop=True) if hasattr(X, "iloc") else pd.DataFrame(X)
+    yp = y.reset_index(drop=True) if hasattr(y, "iloc") else pd.Series(y)
+
+    counts = yp.value_counts().to_dict()
+    n_total = len(yp)
+
+    target_neu = int(min(counts.get(0, 0), max_neutro_ratio * n_total))
+    target_dn  = max(min_amostras_classe, counts.get(-1, 0))
+    target_up  = max(min_amostras_classe, counts.get( 1, 0))
+
+    def _undersample_neutro():
+        mask = (yp == 0)
+        X0, y0 = Xp[mask], yp[mask]
+        n = len(y0)
+        if n <= target_neu:
+            return X0, y0
+        idx = rng.choice(n, size=target_neu, replace=False)
+        return X0.iloc[idx], y0.iloc[idx]
+
+    def _oversample(classe, target):
+        mask = (yp == classe)
+        Xc, yc = Xp[mask], yp[mask]
+        n = len(yc)
+        if n == 0:
+            return Xc.iloc[:0], yc.iloc[:0]
+        if n >= target:
+            idx = rng.choice(n, size=target, replace=False)
+            return Xc.iloc[idx], yc.iloc[idx]
+        add_idx = rng.choice(n, size=target - n, replace=True)
+        return pd.concat([Xc, Xc.iloc[add_idx]]), pd.concat([yc, yc.iloc[add_idx]])
+
+    X0, y0 = _undersample_neutro()
+    Xdn, ydn = _oversample(-1, target_dn)
+    Xup, yup = _oversample( 1, target_up)
+
+    Xb = pd.concat([X0, Xdn, Xup], axis=0).reset_index(drop=True)
+    yb = pd.concat([y0, ydn, yup], axis=0).reset_index(drop=True)
+
+    idx = rng.permutation(len(Xb))
+    Xb, yb = Xb.iloc[idx], yb.iloc[idx]
+
+    log_event(f"[BAL_AVANÇADO] Pós-balanceamento treino: {yb.value_counts().to_dict()}")
     return Xb, yb
 
 
-def validar_features(X, expected_features):
-    missing = set(expected_features) - set(X.columns)
-    extra = set(X.columns) - set(expected_features)
-    if missing:
-        log_event(f"Features faltando: {missing}", level="error")
-        return False
-    if extra:
-        log_event(f"Features extras: {extra}", level="warning")
-    return True
-
+# ========================= LABELING/XGB MAPS =========================
 
 def mapear_label_xgb(y):
     return np.where(y == -1, 0, np.where(y == 0, 1, 2))
@@ -156,18 +237,76 @@ def _salvar_listas_features_compat(prefixo_curto, lista_cols):
         log_event("[TREINO] Lista de features LSTM salva (lstm.pkl).", level="info")
 
 
+# ========================= TREINOS =========================
+
 def treinar_rf(X_train, y_train):
-    modelo = RandomForestClassifier(class_weight='balanced_subsample', n_estimators=100, random_state=42)
+    """
+    Random Forest com pesos anti-neutro e regularização leve.
+    """
+    classes = np.array([-1, 0, 1])
+    base_w = compute_class_weight('balanced', classes=classes, y=y_train)
+    cw = {int(c): float(w) for c, w in zip(classes, base_w)}
+
+    # reforços (podem ser ajustados em config.json):
+    updown_scale = float(cfg.get("rf_peso_updown_scale", 1.7))
+    neutro_scale = float(cfg.get("rf_peso_neutro_scale", 0.6))
+    cw[-1] *= updown_scale
+    cw[ 1] *= updown_scale
+    cw[ 0] *= neutro_scale
+
+    modelo = RandomForestClassifier(
+        n_estimators=int(cfg.get("rf_n_estimators", 400)),
+        max_depth=int(cfg.get("rf_max_depth", 12)),
+        min_samples_leaf=int(cfg.get("rf_min_samples_leaf", 10)),
+        n_jobs=-1,
+        random_state=42,
+        class_weight=cw,
+        max_features=cfg.get("rf_max_features", "sqrt"),
+        bootstrap=True
+    )
     modelo.fit(X_train, y_train)
     _salvar_listas_features_compat("rf", list(X_train.columns))
     return modelo
 
 
-def treinar_xgb(X_train, y_train):
+def treinar_xgb(X_train, y_train, X_val=None, y_val=None):
     if not xgb:
         raise ImportError("XGBoost não instalado.")
-    modelo = xgb.XGBClassifier(n_estimators=100, max_depth=5, random_state=42, use_label_encoder=False, eval_metric='mlogloss')
-    modelo.fit(X_train, y_train, sample_weight=_compute_sample_weight(y_train, w_updown=cfg.get('class_weight_updown', 3.0)))
+    modelo = xgb.XGBClassifier(
+        n_estimators=int(cfg.get("xgb_n_estimators", 600)),
+        max_depth=int(cfg.get("xgb_max_depth", 6)),
+        subsample=float(cfg.get("xgb_subsample", 0.9)),
+        colsample_bytree=float(cfg.get("xgb_colsample_bytree", 0.9)),
+        reg_lambda=float(cfg.get("xgb_reg_lambda", 1.0)),
+        random_state=42,
+        eval_metric='mlogloss',
+        tree_method=cfg.get("xgb_tree_method", "hist")
+    )
+    # y_train (0/1/2)
+    classes_xgb = np.array([0, 1, 2])
+    cw = compute_class_weight('balanced', classes=classes_xgb, y=y_train)
+    wmap = {int(c): float(w) for c, w in zip(classes_xgb, cw)}
+    sample_weight = np.vectorize(wmap.get)(y_train)
+
+    eval_set = [(X_train, y_train)]
+    if X_val is not None and y_val is not None:
+        eval_set.append((X_val, y_val))
+
+    try:
+        modelo.fit(
+            X_train, y_train,
+            sample_weight=sample_weight,
+            eval_set=eval_set,
+            early_stopping_rounds=int(cfg.get("xgb_es_rounds", 50)),
+            verbose=False
+        )
+    except TypeError:
+        modelo.fit(
+            X_train, y_train,
+            sample_weight=sample_weight,
+            eval_set=eval_set,
+            verbose=False
+        )
     _salvar_listas_features_compat("xgb", list(X_train.columns))
     return modelo
 
@@ -175,7 +314,7 @@ def treinar_xgb(X_train, y_train):
 def treinar_lstm(X_train, y_train, X_val, y_val, epochs=50, batch_size=32):
     if not keras:
         raise ImportError("Tensorflow/Keras não instalado.")
-    # Corrigir labels para 0, 1, 2
+    # Corrigir labels para 0,1,2
     y_train = np.where(y_train == -1, 0, np.where(y_train == 0, 1, 2))
     y_val = np.where(y_val == -1, 0, np.where(y_val == 0, 1, 2))
     n_features = X_train.shape[1]
@@ -200,6 +339,8 @@ def treinar_lstm(X_train, y_train, X_val, y_val, epochs=50, batch_size=32):
     _salvar_listas_features_compat("lstm", list(X_train.columns))
     return model
 
+
+# ========================= AVALIAÇÃO & PREPARO =========================
 
 def avaliar_modelo(modelo, X_test, y_test, tipo="rf"):
     if tipo == "lstm":
@@ -240,17 +381,6 @@ def preparar_para_previsao(df, features):
 
 
 def _salvar_avaliacao_ensemble(metrics_dict):
-    """
-    Salva modelos/avaliacao_ensemble.json e logs/avaliacao_ensemble.json
-    no formato:
-    {
-      "timestamp": "...",
-      "acc_min_promocao": 0.55,
-      "random_forest": {"acc": 0.61, "promover": true},
-      "xgboost": {"acc": 0.58, "promover": true},
-      "lstm": {"acc": 0.52, "promover": false}
-    }
-    """
     os.makedirs("modelos", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
     path_modelos = os.path.join("modelos", "avaliacao_ensemble.json")
@@ -262,25 +392,40 @@ def _salvar_avaliacao_ensemble(metrics_dict):
     log_event(f"[AVALIACAO] Arquivo salvo em {path_modelos} e {path_logs}", level="info")
 
 
+# ========================= MAIN =========================
+
 def main():
+    global cfg
+
     features_path = "dados/features.csv"
     os.makedirs("modelos", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 
+    # carrega config
     config_path = "config.json"
-    config = {}
+    cfg = {}
     if os.path.exists(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    treinar_lstm_flag = config.get("treinar_lstm", True)
-    acc_min_promocao = config.get("acc_min_promocao", 0.55)  # limiar para 'promover'
+            cfg = json.load(f)
+
+    treinar_lstm_flag = cfg.get("treinar_lstm", True)
+    acc_min_promocao = cfg.get("acc_min_promocao", 0.55)  # limiar p/ 'promover'
+    usar_meta_features = bool(cfg.get("usar_meta_features", True))
 
     log_event("🚀 Iniciando treino dos modelos ENSEMBLE (RF, XGBoost, LSTM)", level="info")
 
+    # ---- load
     df = carregar_dados(features_path)
     if df is None:
         return
 
+    # ---- meta-features (opcional)
+    if usar_meta_features:
+        df = adicionar_meta_features(df)
+        # preencher NaNs criados pelas janelas
+        df = df.fillna(df.median(numeric_only=True))
+
+    # ---- drops de colunas não-úteis p/ modeling
     drop_cols = ["timestamp", "data_hora", "ativo", "regime", "regime_nome", "regime_hmm"]
     for col in drop_cols:
         if col in df.columns:
@@ -290,13 +435,13 @@ def main():
     if "sinal" not in df.columns:
         log_event("❌ Coluna 'sinal' não encontrada após drop de cols.", level="error")
         return
+
     y = df["sinal"].copy()
     X = df.drop(columns=["sinal"])
 
     log_event(f"Distribuição original: {y.value_counts().to_dict()}")
 
-    X = filtrar_apenas_numericas(X)
-    X = X.fillna(0)
+    X = filtrar_apenas_numericas(X).fillna(0)
 
     if len(X) != len(y):
         log_event(f"❌ X e y desalinhados! X.shape={X.shape}, y.shape={y.shape}", level="error")
@@ -305,17 +450,26 @@ def main():
         log_event(f"❌ X ou y vazio após filtragem!", level="error")
         return
 
-    X, y = balancear_labels(X, y, perc_neutro=0.20, min_amostra=150)
-    log_event(f"Distribuição balanceada: {y.value_counts().to_dict()}")
+    # === NÃO balancear aqui (evita vazamento). Fazemos após split. ===
 
+    # Split temporal
     n = len(X)
     train_size = int(0.7 * n)
     val_size = int(0.15 * n)
     test_size = n - train_size - val_size
 
     X_train, y_train = X.iloc[:train_size], y.iloc[:train_size]
-    X_val, y_val = X.iloc[train_size:train_size+val_size], y.iloc[train_size:train_size+val_size]
-    X_test, y_test = X.iloc[train_size+val_size:], y.iloc[train_size+val_size:]
+    X_val,   y_val   = X.iloc[train_size:train_size+val_size], y.iloc[train_size:train_size+val_size]
+    X_test,  y_test  = X.iloc[train_size+val_size:], y.iloc[train_size+val_size:]
+
+    # === Balanceamento avançado APENAS no treino ===
+    max_neu = float(cfg.get("max_neutro_ratio_treino", 0.25))
+    min_cls = int(cfg.get("min_amostras_classe_treino", 150))
+    X_train, y_train = balancear_labels_avancado(
+        X_train, y_train,
+        max_neutro_ratio=max_neu,
+        min_amostras_classe=min_cls
+    )
 
     log_event(f"Shapes - X_train: {X_train.shape}, X_val: {X_val.shape}, X_test: {X_test.shape}")
 
@@ -340,7 +494,7 @@ def main():
     indices = np.argsort(importances)[::-1]
     log_event("Feature Importance (RF):")
     for i in indices[:10]:
-        log_event(f"{X.columns[i]}: {importances[i]:.4f}")
+        log_event(f"{X_train.columns[i]}: {importances[i]:.4f}")
 
     avaliacao["random_forest"] = {
         "acc": float(acc_rf),
@@ -351,14 +505,19 @@ def main():
     if xgb:
         try:
             y_train_xgb = mapear_label_xgb(y_train)
+            y_val_xgb = mapear_label_xgb(y_val)
             y_test_xgb = mapear_label_xgb(y_test)
-            modelo_xgb = treinar_xgb(X_train, y_train_xgb)
+            modelo_xgb = treinar_xgb(X_train, y_train_xgb, X_val, y_val_xgb)
             X_test_xgb = preparar_para_previsao(X_test, "modelos/features_treinadas_xgb.pkl")
             if X_test_xgb.shape[1] != X_train.shape[1]:
                 log_event(f"[XGB] Shape mismatch: X_test {X_test_xgb.shape}, X_train {X_train.shape}", level="error")
             acc_xgb, report_xgb, cm_xgb, y_pred_xgb = avaliar_modelo(modelo_xgb, X_test_xgb, y_test_xgb, "xgb")
-            modelo_xgb.save_model("modelos/xgb_cerebro.json")
-            modelo_xgb.save_model(f"modelos/xgb_cerebro_{timestamp}.json")
+            try:
+                modelo_xgb.save_model("modelos/xgb_cerebro.json")
+                modelo_xgb.save_model(f"modelos/xgb_cerebro_{timestamp}.json")
+            except Exception:
+                joblib.dump(modelo_xgb, "modelos/xgb_cerebro.joblib")
+                joblib.dump(modelo_xgb, f"modelos/xgb_cerebro_{timestamp}.joblib")
             log_event(f"XGBoost treinado. Acc={acc_xgb:.4f}", level="info")
             salvar_relatorio("[XGB]\n" + report_xgb + "\nConfMatrix:\n" + str(cm_xgb), "xgb")
             train_acc_xgb = accuracy_score(y_train_xgb, modelo_xgb.predict(X_train))
@@ -410,7 +569,6 @@ def main():
     _salvar_avaliacao_ensemble(avaliacao)
 
     log_event("🏁 Treino dos modelos ensemble finalizado!", level="info")
-
 
 
 def _compute_sample_weight(y, w_updown=3.0):

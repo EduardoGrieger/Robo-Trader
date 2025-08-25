@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import os, sys, json, argparse, inspect
 import pandas as pd
+import numpy as np
 
 # garante acesso a utils/ e afins
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -112,8 +113,93 @@ def _pick_best_labeling(sumA: dict, sumB: dict) -> str:
         )
     return "A" if _key(sumA) > _key(sumB) else "B"
 
-# -------------------- main --------------------
+# -------------------- util para garantir folds --------------------
+def _autoshrink_val_size(ds:int, val_size:int|None, anchored:bool, cfg:dict):
+    """
+    Ajusta val_size para garantir pelo menos min_folds; se necessário,
+    informa o ajuste via log_event.
+    """
+    min_train = int(cfg.get("train_min", 1000))
+    min_folds = int(cfg.get("min_folds", 2))
+    vmin = int(cfg.get("val_min", 300))
+    vmax = int(cfg.get("val_max", 4000))
+
+    if val_size is None:
+        # chute inicial: 1/(min_folds+2) do dataset
+        vs = max(vmin, min(vmax, ds // (min_folds + 2)))
+    else:
+        vs = int(val_size)
+
+    if anchored:
+        # nº de folds (aprox) = floor((N - min_train)/val_size)
+        if ds - min_train <= 0:
+            return vs, min_train, 0
+        folds = (ds - min_train) // max(1, vs)
+        if folds < min_folds:
+            new_vs = max(vmin, (ds - min_train) // max(1, min_folds))
+            if new_vs != vs:
+                log_event(f"[WF] val_size ajustado {vs} -> {new_vs} para obter >= {min_folds} folds (N={ds}, min_train={min_train}).", "warning")
+                vs = new_vs
+            folds = (ds - min_train) // max(1, vs)
+        return vs, min_train, int(folds)
+    else:
+        # janelas desancoradas tendem a produzir mais folds; mantemos o vs
+        folds = max(1, (ds // max(1, vs)) - 1)
+        return vs, min_train, int(folds)
+
+# -------------------- tau meta --------------------
+def _optimize_tau_meta(scores, labels):
+    """Otimiza tau maximizando MCC com penalização de cobertura."""
+    import numpy as np
+    try:
+        from scipy.optimize import minimize_scalar as _ms
+    except Exception:
+        _ms = None
+    from sklearn.metrics import matthews_corrcoef
+
+    scores = np.asarray(scores, dtype=float)
+    labels = np.asarray(labels, dtype=int)
+    # map 0/1/2 -> -1/0/1 if needed
+    labels = np.where(labels==2, 1, np.where(labels==0, 0, np.where(labels==-1, -1, labels)))
+
+    def objective(tau):
+        preds = np.where(scores > tau, 1, np.where(scores < -tau, -1, 0))
+        mcc = matthews_corrcoef(labels, preds)
+        cov = np.mean(preds != 0)
+        penalty = max(0, 0.30 - cov)*5 + max(0, cov - 0.65)*3
+        return -(mcc - penalty)
+
+    if _ms is None:
+        grid = np.linspace(0.45, 0.70, 26)
+        best = max(grid, key=lambda t: -objective(t))
+        return float(best)
+    res = _ms(objective, bounds=(0.45, 0.70), method='bounded')
+    return float(res.x)
+
+def _try_add_tau_meta(summary_dict, fm_path):
+    try:
+        import pandas as pd, numpy as np, os
+        if not os.path.exists(fm_path):
+            return summary_dict
+        dfm = pd.read_csv(fm_path)
+        cand_cols_score = [c for c in dfm.columns if 'score' in c.lower()]
+        cand_cols_label = [c for c in dfm.columns if 'label' in c.lower()]
+        if not cand_cols_score or not cand_cols_label:
+            return summary_dict
+        scores = dfm[cand_cols_score[0]].values
+        labels = dfm[cand_cols_label[0]].values
+        tau_meta = _optimize_tau_meta(scores, labels)
+        summary_dict['tau_star_meta'] = float(tau_meta)
+        # clamp delta
+        d = float(summary_dict.get('delta_star', 0.0))
+        summary_dict['delta_star_meta'] = 0.05 if d < 0.03 else d
+    except Exception as e:
+        log_event(f"[WF] não foi possível calcular tau_meta: {e}", "warning")
+    return summary_dict
+
+
 def main():
+    import argparse
     ap = argparse.ArgumentParser(description="Walk-Forward A/B e promoção do vencedor (sem mexer no treino).")
     ap.add_argument("--features", "-f", default="dados/features.csv", help="CSV de features.")
     ap.add_argument("--out", "-o", default="logs", help="Diretório de saída (default: logs).")
@@ -133,16 +219,12 @@ def main():
         log_event("[WF] coluna 'sinal' ausente no features.csv", "error")
         sys.exit(2)
 
-    # Determina val_size (se não veio)
+    ds = len(df)
+
+    # Determina val_size (se não veio) e garante nº de folds
     val_size = args.val_size
-    if val_size is None:
-        # fallback conservador baseado no tamanho do dataset
-        ds = len(df)
-        val_size = max(1500, min(4000, ds // 8))
-        # se houver hint no config, usa como teto
-        hint = int(cfg.get("janela_candles", 3000))
-        val_size = min(val_size, max(1000, hint))
-        log_event(f"[WF] val_size inferido: {val_size}", "info")
+    val_size, min_train, folds_est = _autoshrink_val_size(ds, val_size, args.anchored, cfg)
+    log_event(f"[WF] N={ds} | anchored={args.anchored} | val_size={val_size} | min_train={min_train} | folds_est~{folds_est}", "info")
 
     # cria pastas
     outA = os.path.join(args.out, "A")
@@ -152,12 +234,25 @@ def main():
 
     # ---------- A) baseline usando 'sinal' já existente ----------
     log_event("[WF/A] iniciando...", "info")
-    metA, sumA = _call_run_wf(
-        run_walk_forward_df,
-        df=df, label_col="sinal",
-        val_size=val_size, anchored=args.anchored,
-        outdir=outA, model="rf", tag="A"
-    )
+    try:
+        metA, sumA = _call_run_wf(
+            run_walk_forward_df,
+            df=df, label_col="sinal",
+            val_size=val_size, anchored=args.anchored,
+            outdir=outA, model="rf", tag="A"
+        )
+    except RuntimeError as e:
+        msg = str(e)
+        log_event(f"[WF/A] falhou: {msg} — tentando reduzir val_size e repetir.", "warning")
+        # tenta uma redução adicional de 25% e reexecuta uma vez
+        new_vs = max(200, int(val_size * 0.75))
+        metA, sumA = _call_run_wf(
+            run_walk_forward_df,
+            df=df, label_col="sinal",
+            val_size=new_vs, anchored=args.anchored,
+            outdir=outA, model="rf", tag="A"
+        )
+        log_event(f"[WF/A] recuperado com val_size={new_vs}.", "info")
 
     # ---------- B) re-rotular simétrico (se houver labeling disponível) ----------
     metB, sumB = metA, sumA  # fallback
@@ -173,12 +268,23 @@ def main():
                           "sl_pips": int(cfg.get("tp_pips", 40)),
                           "janela": 12}
             )
-            metB, sumB = _call_run_wf(
-                run_walk_forward_df,
-                df=dfB, label_col="sinal",
-                val_size=val_size, anchored=args.anchored,
-                outdir=outB, model="rf", tag="B"
-            )
+            try:
+                metB, sumB = _call_run_wf(
+                    run_walk_forward_df,
+                    df=dfB, label_col="sinal",
+                    val_size=val_size, anchored=args.anchored,
+                    outdir=outB, model="rf", tag="B"
+                )
+            except RuntimeError as e:
+                log_event(f"[WF/B] falhou: {e} — reduzindo val_size e repetindo.", "warning")
+                new_vs = max(200, int(val_size * 0.75))
+                metB, sumB = _call_run_wf(
+                    run_walk_forward_df,
+                    df=dfB, label_col="sinal",
+                    val_size=new_vs, anchored=args.anchored,
+                    outdir=outB, model="rf", tag="B"
+                )
+                log_event(f"[WF/B] recuperado com val_size={new_vs}.", "info")
         except Exception as e:
             log_event(f"[WF/B] falhou ao re-rotular/rodar: {e}", "warning")
     else:
@@ -197,6 +303,20 @@ def main():
         with open(os.path.join(outB, "walkforward_summary.json"), "w", encoding="utf-8") as fB:
             json.dump(sumB, fB, ensure_ascii=False, indent=2)
 
+        # tentar calcular tau_meta a partir do CSV de métricas do vencedor
+        fm_srcs = [
+            os.path.join(args.out, escolha, 'fold_metrics_walkforward.csv'),
+            os.path.join(args.out, escolha, 'fold_metrics.csv'),
+        ]
+        fm_winner = next((p for p in fm_srcs if os.path.exists(p)), None)
+        if isinstance(vencedor, dict) and fm_winner:
+            vencedor = _try_add_tau_meta(vencedor, fm_winner)
+        # clamp delta_star
+        try:
+            if float(vencedor.get('delta_star', 0.0)) < 0.03:
+                vencedor['delta_star'] = 0.05
+        except Exception:
+            pass
         # promover vencedor para raiz (logs/)
         with open(os.path.join(args.out, "walkforward_summary.json"), "w", encoding="utf-8") as fp:
             json.dump(vencedor, fp, ensure_ascii=False, indent=2)

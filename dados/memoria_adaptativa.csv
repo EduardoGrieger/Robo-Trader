@@ -1,7 +1,13 @@
-timestamp,ativo,sinal,resultado,padrao,score,acertos,erros,total
-,EURUSD,,,RandomForestClassifier,-4,0,4,4
-,GBPUSD,,,RandomForestClassifier,-4,0,4,4
-,EURUSD,,,Fallback Técnico,-4,0,4,4
-,GBPUSD,,,Fallback Técnico,-4,0,4,4
-,EURUSD,,,RandomForest:-1|XGBoost:-1|LSTM:0,-2,0,2,2
-,EURUSD,,,RandomForest:0|XGBoost:-1|LSTM:1,-2,0,2,2
+ativo,padrao,score,acertos,erros,total
+EURUSD,RandomForestClassifier,-4,0,4,4
+GBPUSD,RandomForestClassifier,-4,0,4,4
+EURUSD,Fallback Técnico,-4,0,4,4
+GBPUSD,Fallback Técnico,-4,0,4,4
+EURUSD,RandomForest:-1|XGBoost:-1|LSTM:0,-2,0,2,2
+EURUSD,RandomForest:0|XGBoost:-1|LSTM:1,-2,0,2,2
+EURUSD,nan,1,1,0,1
+GBPUSD,nan,1,1,0,1
+EURUSD,nan,1,1,0,1
+GBPUSD,nan,1,1,0,1
+EURUSD,interpretacao,3,3,0,3
+GBPUSD,interpretacao,3,3,0,3

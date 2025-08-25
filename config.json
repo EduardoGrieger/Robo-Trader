@@ -6,19 +6,17 @@
   "max_drawdown_diario": 0.05,
   "max_drawdown_total": 0.1,
   "risco_por_trade_percentual": 1.0,
-
   "volume_padrao": 0.2,
   "volumes": {
     "EURUSD": 0.2,
     "GBPUSD": 0.2
   },
-
   "modelos_sinal": {
     "random_forest": { "ativo": true },
-    "xgboost":       { "ativo": true },
-    "lstm":          { "ativo": true }
+    "xgboost": { "ativo": true },
+    "lstm": { "ativo": true }
   },
-  "ensemble_voting": "media",
+  "ensemble_voting": "max",
 
   "sl_pips": 20,
   "tp_pips": 40,
@@ -29,7 +27,13 @@
     "EURUSD": "M5",
     "GBPUSD": "M5"
   },
-  "janela_candles": 20000,
+
+  "janela_candles": 12000,
+  "train_min": 1000,
+  "min_folds": 2,
+  "val_min": 300,
+  "val_max": 4000,
+
   "intervalo_execucao_minutos": 5,
   "modo_operacao": "hibrido",
   "risco_retorno": "dinamico",
@@ -47,7 +51,6 @@
   "contexto_volume_window": 20,
   "contexto_volume_multiplier": 1.5,
   "squeeze_bandwidth_factor": 0.005,
-
   "infer_volatility_high_ratio": 1.5,
   "infer_volatility_med_ratio": 0.9,
   "infer_volume_high_ratio": 1.5,
@@ -58,9 +61,11 @@
     { "inicio": "00:00", "fim": "17:00" },
     { "inicio": "17:30", "fim": "23:59" }
   ],
+
   "meta_gain_mes": 10.0,
   "meta_loss_dia": -2.0,
   "pausar_feriado": true,
+
   "alerta_mercado_fechado_intervalo_padrao": 120,
   "alerta_mercado_fechado_intervalo_proximo": 5,
   "alerta_mercado_fechado_intervalo_final": 1,
@@ -82,10 +87,10 @@
   },
 
   "anti_neutro": true,
-  "anti_neutro_threshold": 0.5,
-  "anti_neutro_margin": 0.03,
-  "neutro_weight": 0.4,
-  "xgb_neutro_cap": 0.65,
+  "anti_neutro_threshold": 0.55,
+  "anti_neutro_margin": 0.05,
+  "neutro_weight": 0.3,
+  "xgb_neutro_cap": 0.6,
 
   "label_params": {
     "tp_pips": 40,
@@ -97,7 +102,6 @@
 
   "backup_em_cada_ciclo": false,
   "promover_modelos_apos_retreino": true,
-
   "min_evid_padroes": 20,
   "tp_sl_block_confidence": 0.6,
   "tp_sl_penalty": 0.1,
@@ -110,13 +114,12 @@
   "telegram_poll_timeout_sec": 5,
   "telegram_allowed_users": ["1201417203"],
 
-  "sniper_rsi_low": 30,
-  "sniper_rsi_high": 70,
+  "sniper_rsi_low": 10,
+  "sniper_rsi_high": 90,
   "sniper_rsi_period": 14,
   "sniper_requires_no_squeeze": false,
   "sniper_min_volatility": "baixa",
   "sniper_require_regime": "",
-
   "tp_sl_intracandle_priority": "SL",
 
   "forex_open_utc": "21:00",
@@ -124,21 +127,27 @@
 
   "usar_thresholds_walkforward": true,
   "stale_thresholds_dias": 7,
-  "ensemble_2x1_conf": true,
-  "ensemble_min_conf": 0.7,
 
+  "ensemble_2x1_conf": true,
+  "ensemble_min_conf": 0.55,
   "turbo_override_enable": true,
   "turbo_override_conf": 0.8,
   "turbo_requires_no_squeeze": false,
   "turbo_volume_multiplier": 0.5,
 
   "sniper_scoring_enable": true,
-  "sniper_score_weights": { "tendencia": 1.0, "vol_ok": 1.0, "no_squeeze": 1.0, "spread_ok": 1.0 },
+  "sniper_score_weights": {
+    "tendencia": 1.0,
+    "vol_ok": 1.0,
+    "no_squeeze": 1.0,
+    "spread_ok": 1.0
+  },
   "sniper_score_trade_min": 2,
   "sniper_score_microlote_if_one": true,
   "sniper_score_gate_enable": true,
 
   "regime_threshold_adjust_trend": 0.03,
+
   "class_weight_updown": 4.0,
 
   "ev_rule_enable": true,
@@ -151,5 +160,26 @@
     "mult_hi": 1.5,
     "mult_mid": 0.75,
     "mult_low": 0.25
-  }
+  },
+
+  "usar_modo_sniper": false,
+
+  "usar_meta_features": true,
+  "max_neutro_ratio_treino": 0.25,
+  "min_amostras_classe_treino": 150,
+
+  "rf_peso_updown_scale": 1.7,
+  "rf_peso_neutro_scale": 0.6,
+  "rf_n_estimators": 400,
+  "rf_max_depth": 12,
+  "rf_min_samples_leaf": 10,
+  "rf_max_features": "sqrt",
+
+  "xgb_n_estimators": 600,
+  "xgb_max_depth": 6,
+  "xgb_subsample": 0.9,
+  "xgb_colsample_bytree": 0.9,
+  "xgb_reg_lambda": 1.0,
+  "xgb_tree_method": "hist",
+  "xgb_es_rounds": 50
 }

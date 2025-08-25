@@ -257,6 +257,42 @@ def calcular_sinais_derivados(df):
     log_event("[features] Sinais derivados calculados (squeeze sem look-ahead)")
     return df
 
+def calcular_meta_features_treino(df):
+    """
+    Gera as MESMAS meta-features usadas no treino/inferência:
+      - volatility_20, volatility_50 (std de retornos)
+      - trend_strength (|slope| / std)
+      - range_ratio ((high-low)/sma20(close))
+    Sem look-ahead; tolerante a séries curtas.
+    """
+    df = df.copy()
+    ok_close = "close" in df.columns
+    ok_h = "high" in df.columns
+    ok_l = "low" in df.columns
+
+    try:
+        if ok_close:
+            ret = df["close"].pct_change()
+            df["volatility_20"] = ret.rolling(20).std()
+            df["volatility_50"] = ret.rolling(50).std()
+            df["trend_strength"] = df["close"].rolling(20).apply(
+                lambda x: (abs(np.polyfit(range(len(x)), x, 1)[0]) / (np.std(x) + 1e-12)) if np.std(x) > 0 else 0,
+                raw=False
+            )
+        if ok_close and ok_h and ok_l:
+            sma20 = df["close"].rolling(20).mean()
+            sma20 = sma20.replace(0, np.nan)
+            df["range_ratio"] = (df["high"] - df["low"]) / sma20
+            df["range_ratio"] = df["range_ratio"].fillna(0.0)
+        log_event("[features] Meta-features (vol20, vol50, trend_strength, range_ratio) geradas")
+    except Exception as e:
+        log_event(f"[features] Falha ao gerar meta-features: {e}", level="warning")
+        # Ainda assim, garante existência das colunas
+        for c in ("volatility_20", "volatility_50", "trend_strength", "range_ratio"):
+            if c not in df.columns:
+                df[c] = 0.0
+    return df
+
 def calcular_regime_mercado(df, n_clusters=3):
     if len(df) < 2:
         df = df.copy()
@@ -464,7 +500,9 @@ def pre_processar_final(df):
     essenciais = [
         "close", "rsi", "sma_20", "sma_50", "bb_high", "bb_low", "sinal",
         "macd", "macd_signal", "macd_hist", "ema_21", "ema_200", "ema_distance",
-        "atr_14", "adx_14", "cci", "stoch_k", "stoch_d"
+        "atr_14", "adx_14", "cci", "stoch_k", "stoch_d",
+        # meta-features do treino/inferência
+        "volatility_20", "volatility_50", "trend_strength", "range_ratio"
     ]
 
     # Remove colunas “mortas”
@@ -529,7 +567,9 @@ def auditar_features_ultima_linha(df, ativo=""):
     essenciais = [
         "close", "rsi", "sma_20", "sma_50", "bb_high", "bb_low", "sinal",
         "macd", "macd_signal", "macd_hist", "ema_21", "ema_200",
-        "atr_14", "adx_14", "cci", "stoch_k", "stoch_d"
+        "atr_14", "adx_14", "cci", "stoch_k", "stoch_d",
+        # meta-features do treino/inferência
+        "volatility_20", "volatility_50", "trend_strength", "range_ratio"
     ]
 
     ausentes = [c for c in essenciais if c not in df.columns]
@@ -577,6 +617,9 @@ def calcular_features(candles, config, ativo=""):
         df = calcular_price_action(df)
         df = calcular_contexto_mercado(df)
         df = calcular_sinais_derivados(df)
+
+        # === META-FEATURES que precisam existir para bater com o treino/inferência ===
+        df = calcular_meta_features_treino(df)
 
         n_clusters = config.get("n_clusters_regime", 3)
         n_states = config.get("n_states_hmm", 3)

@@ -1,4 +1,5 @@
-padrao,evidencia,score
-compra_tendencia_manha,30,1.0
-venda_lateral_noite,10,0.2
-neutro,5,0.0
+ativo,padrao,acertos,erros,neutros,total
+nan,compra_tendencia_manha,0,0,0,0
+nan,venda_lateral_noite,0,0,0,0
+nan,neutro,0,0,0,0
+EURUSD,sem_sinal_indefinido_sem_contexto,1,4,0,5

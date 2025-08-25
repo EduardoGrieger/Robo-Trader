@@ -4,6 +4,7 @@ from datetime import datetime
 from mt5.executar_ordem_mt5 import enviar_ordem, fechar_ordem
 from utils.registrar_operacao import registrar_operacao, atualizar_operacao
 from utils.sinal_utils import normalizar_sinal
+from utils.utils import carregar_config
 
 # Logs
 try:
@@ -19,10 +20,27 @@ try:
 except Exception:
     MT5_OK = False
 
+# Adaptativo (opcional)
+try:
+    from utils.lote_adaptativo import calcular_lote_adaptativo  # pode não existir
+except Exception:
+    calcular_lote_adaptativo = None  # type: ignore
+
 
 # -------------------------
 # Helpers
 # -------------------------
+def _sf(x, default=None):
+    """Safe float: lida com None e strings com vírgula/ponto."""
+    try:
+        return float(x)
+    except Exception:
+        try:
+            return float(str(x).replace(",", "."))
+        except Exception:
+            return default
+
+
 def _ajustar_volume_para_simbolo(volume: float, si) -> float:
     """Ajusta o volume para step/min/max do símbolo (trunca para baixo; arredonda pela precisão do step)."""
     try:
@@ -59,7 +77,7 @@ def _symbol_info_str(si) -> str:
 def _diagnosticar_envio(ativo: str, tipo: str, volume: float, resultado: dict):
     """Coleta informações úteis do MT5 após um envio (especialmente quando falhou)."""
     if not MT5_OK:
-        return {"mt5": "indisponivel"}
+        return {"mt5": "indisponivel", "volume_enviado": volume}
     diag = {}
     try:
         si = mt5.symbol_info(ativo)
@@ -93,19 +111,19 @@ def _diagnosticar_envio(ativo: str, tipo: str, volume: float, resultado: dict):
             "tipo": tipo,
             "volume_enviado": volume,
         }
-        lvl = "info" if str(diag.get("retcode", "")).startswith(("10009","10008","10004","100")) else "error"
+        lvl = "info" if str(diag.get("retcode", "")).startswith(("10009","10008","10004","100")) else "warning"
         log_event(
             f"[MT5/DIAG] ativo={ativo} tipo={tipo} volume={volume} retcode={diag.get('retcode')} "
             f"comment={diag.get('comment')} last_error={diag.get('last_error')} | {_symbol_info_str(si)}",
             level=lvl
         )
     except Exception as e:
-        diag = {"erro_diag": str(e)}
+        diag = {"erro_diag": str(e), "volume_enviado": volume}
     return diag
 
 
 def _retcode_sucesso(ret) -> bool:
-    """Sucesso se ordem foi executada/colocada: 10009 (DONE), 10008 (PLACED), 10004 (DONE_PARTIAL)."""
+    """Sucesso se ordem foi executada/colocada: 10009 (DONE), 10008 (PLACED), 10004 (DONE_PARTIAL) ou 100xx genérico."""
     try:
         if isinstance(ret, str):
             return ret.startswith("100")
@@ -114,24 +132,43 @@ def _retcode_sucesso(ret) -> bool:
         return False
 
 
-# -------------------------
-# API principal
-# -------------------------
-def abrir_ordem_e_registrar(
-    ativo: str,
-    tipo: str,
-    volume: float,
-    timestamp=None,
-    preco_abertura=None,
-    contexto="",
-    observacao="",
-):
-    """Envia ordem via executor e registra no banco quando sucesso. Sempre devolve 'motivo' e 'diagnostico'."""
-    if timestamp is None:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def _resolver_volume(ativo: str, volume_param, contexto) -> float:
+    """
+    Resolve o volume a enviar:
+      - se volume_param vier válido (>0), usa-o;
+      - senão tenta calcular_lote_adaptativo(…);
+      - senão usa config.volumes[ativo] ou volume_padrao;
+      - por fim, ajusta ao step/min/max do símbolo.
+    """
+    cfg = carregar_config()
+    origem = "param"
+    vol = _sf(volume_param, None)
+    detalhes_lote = None
 
-    # Ajuste prévio de volume pelo símbolo (log se houve ajuste)
-    volume_original = float(volume)
+    if not vol or vol <= 0:
+        origem = "adaptativo"
+        vol = None
+        if calcular_lote_adaptativo:
+            try:
+                # Compatível com diferentes assinaturas: não passamos kwargs desconhecidas.
+                # Preferimos return_all=True; se não suportar, caímos para retorno escalar.
+                try:
+                    res = calcular_lote_adaptativo(ativo=ativo, contexto=contexto, return_all=True)  # type: ignore
+                    detalhes_lote = res
+                    vol = _sf(res.get("lote_utilizado"), None)
+                    if vol is None:
+                        vol = _sf(res.get("lote_bruto_teorico"), None)
+                except TypeError:
+                    vol = _sf(calcular_lote_adaptativo(ativo=ativo, contexto=contexto), None)  # type: ignore
+            except Exception as e:
+                log_event(f"[ENVIO ORDEM] calcular_lote_adaptativo falhou: {e}", level="warning")
+                vol = None
+        if not vol or vol <= 0:
+            origem = "config"
+            vol = cfg.get("volumes", {}).get(ativo, cfg.get("volume_padrao", 0.01))
+            vol = _sf(vol, 0.01)
+
+    # Ajuste ao step/min/max do símbolo
     if MT5_OK:
         try:
             si = mt5.symbol_info(ativo)
@@ -142,28 +179,59 @@ def abrir_ordem_e_registrar(
                 except Exception:
                     si = None
             if si is not None:
-                volume_aj = _ajustar_volume_para_simbolo(volume_original, si)
-                if abs(volume_aj - volume_original) > 1e-12:
+                vol_adj = _ajustar_volume_para_simbolo(vol, si)
+                if abs(vol_adj - vol) > 1e-12:
                     log_event(
-                        f"[ENVIO ORDEM] Ajuste de volume pelo símbolo | {ativo}: {volume_original} -> {volume_aj} | {_symbol_info_str(si)}",
+                        f"[ENVIO ORDEM] Ajuste de volume pelo símbolo | {ativo}: {vol} -> {vol_adj} | {_symbol_info_str(si)}",
                         level="warning"
                     )
-                volume = volume_aj
+                vol = vol_adj
         except Exception as e:
             log_event(f"[ENVIO ORDEM] Falha ao ajustar volume pelo símbolo | {ativo}: {e}", level="warning")
 
-    # Envio — o executor já retorna 'motivo' e 'diagnostico'
-    resultado = enviar_ordem(tipo, ativo, timestamp, volume=volume)
+    # Log detalhado da origem e detalhes (se houver)
+    if detalhes_lote:
+        log_event(f"[ENVIO ORDEM] Volume resolvido={vol} (origem={origem}) | detalhes_lote={detalhes_lote}", level="info")
+    else:
+        log_event(f"[ENVIO ORDEM] Volume resolvido={vol} (origem={origem})", level="info")
+
+    return float(vol)
+
+
+# -------------------------
+# API principal
+# -------------------------
+def abrir_ordem_e_registrar(
+    ativo: str,
+    tipo: str,
+    volume=None,                  # <- aceita None
+    timestamp=None,
+    preco_abertura=None,          # mantido p/ compat
+    contexto="",
+    observacao="",
+):
+    """Envia ordem via executor e registra no banco quando sucesso. Sempre devolve 'motivo' e 'diagnostico'."""
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Resolve volume (evita float(None))
+    ctx_dict = contexto if isinstance(contexto, dict) else {}
+    vol_final = _resolver_volume(ativo, volume, ctx_dict)
+
+    # Envio — propagamos o contexto para o executor (ele loga e pode usar se for calcular lote)
+    resultado = enviar_ordem(tipo, ativo, timestamp, volume=vol_final, contexto=ctx_dict)
 
     ticket = resultado.get("order")
     retcode = resultado.get("retcode")
     preco_exec = resultado.get("preco") or preco_abertura
 
     # Diagnóstico adicional: MERGE (não sobrescreve o que já veio do executor)
-    diag_extra = _diagnosticar_envio(ativo, tipo, volume, resultado)
+    diag_extra = _diagnosticar_envio(ativo, tipo, vol_final, resultado)
     if isinstance(resultado, dict):
         if isinstance(resultado.get("diagnostico"), dict):
-            resultado["diagnostico"].update({k: v for k, v in diag_extra.items() if k not in resultado["diagnostico"]})
+            # não sobrescreve chaves existentes
+            for k, v in diag_extra.items():
+                resultado["diagnostico"].setdefault(k, v)
         else:
             resultado["diagnostico"] = diag_extra
 
@@ -173,13 +241,13 @@ def abrir_ordem_e_registrar(
             registrar_operacao(
                 ativo=ativo,
                 ticket=ticket,
-                padrao="",
+                padrao="",  # o main_loop registra contexto/padrão detalhado em outras rotinas
                 regime="",
                 contexto=contexto if isinstance(contexto, str) else str(contexto),
                 hora=datetime.now().strftime("%H:%M:%S"),
                 motivo_fechamento="",
                 retcode=retcode,
-                volume=volume,
+                volume=vol_final,
                 observacao=observacao,
                 timestamp=timestamp,
                 preco_abertura=preco_exec,
@@ -195,7 +263,7 @@ def abrir_ordem_e_registrar(
 
     # Falha → já tem motivo + diagnostico no resultado
     log_event(
-        f"[ENVIO ORDEM] NÃO REGISTRADA | ativo={ativo} tipo={tipo} volume={volume} "
+        f"[ENVIO ORDEM] NÃO REGISTRADA | ativo={ativo} tipo={tipo} volume={vol_final} "
         f"retcode={retcode} ticket={ticket} motivo={resultado.get('motivo')} diag={resultado.get('diagnostico')}",
         level="warning"
     )
