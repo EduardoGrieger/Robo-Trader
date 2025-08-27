@@ -6,17 +6,22 @@
   "max_drawdown_diario": 0.05,
   "max_drawdown_total": 0.1,
   "risco_por_trade_percentual": 1.0,
+  "valor_pip_lote_padrao": 100000,
   "volume_padrao": 0.2,
   "volumes": {
     "EURUSD": 0.2,
     "GBPUSD": 0.2
   },
+
   "modelos_sinal": {
     "random_forest": { "ativo": true },
     "xgboost": { "ativo": true },
     "lstm": { "ativo": true }
   },
+
   "ensemble_voting": "max",
+  "ensemble_min_conf": 0.62,
+  "neutro_weight": 0.3,
 
   "sl_pips": 20,
   "tp_pips": 40,
@@ -89,7 +94,6 @@
   "anti_neutro": true,
   "anti_neutro_threshold": 0.55,
   "anti_neutro_margin": 0.05,
-  "neutro_weight": 0.3,
   "xgb_neutro_cap": 0.6,
 
   "label_params": {
@@ -129,7 +133,6 @@
   "stale_thresholds_dias": 7,
 
   "ensemble_2x1_conf": true,
-  "ensemble_min_conf": 0.55,
   "turbo_override_enable": true,
   "turbo_override_conf": 0.8,
   "turbo_requires_no_squeeze": false,
@@ -181,5 +184,45 @@
   "xgb_colsample_bytree": 0.9,
   "xgb_reg_lambda": 1.0,
   "xgb_tree_method": "hist",
-  "xgb_es_rounds": 50
+  "xgb_es_rounds": 50,
+
+  "timezone_servidor_offset_horas": -3.0,
+  
+  "telemetria_tempo_ciclo_csv": true,
+
+  "protecao": {
+    "gatilho_pnl_aberto": -250.0,
+    "janela_minutos": 10,
+    "cooldown_minutos": 45,
+    "max_posicoes_por_ativo": 1
+  },
+
+  "vies": {
+    "vote_monitor_janela": 500,
+    "warn_threshold": 0.80,
+    "min_window_for_warn": 200,
+    "reduzir_lote_quando_enviesado": true,
+    "mult_enviesado": 0.5
+  },
+
+  "retreino": {
+    "delta_min_promocao_acc_pp": 1.5,
+    "gate_walkforward": { "pf_min": 1.2, "acerto_min": 0.55, "min_folds_ok": 3 },
+    "seed_global": 42,
+    "undersample_neutro_treino": 0.25,
+    "class_weight_updown_boost": 1.2
+  },
+
+  "healthcheck": {
+    "symbols_check": ["EURUSD", "GBPUSD"],
+    "max_tick_silencio_min": 5,
+    "pending_order_timeout_sec": 60,
+    "telegram_cooldown_min": 10
+  },
+
+  "exposicao": {
+  "incremento_habilitar": false,
+  "incremento_conf_min": 0.80,
+  "incremento_pnl_dia_min": 0.0
+  }
 }

@@ -12,9 +12,23 @@ from utils.eh_feriado import eh_feriado
 from mt5.coletar_candles_mt5 import coletar_candles
 from features.gerar_features import calcular_features
 from inteligencia.estrategia_ia import gerar_sinal
-from inteligencia.validar_tp_sl import validar_tp_sl_historico
+from inteligencia.validar_tp_sl import validar_tp_sl_historico  # <-- (ajuste de import se necessário)
 from utils.debug_logger import log_event, log_delay_execucao, log_decisao
+
+def _pode_abrir_nova_posicao(ativo: str, max_por_ativo: int) -> bool:
+    try:
+        poss = mt5.positions_get(symbol=ativo) or []
+        return len(poss) < int(max_por_ativo)
+    except Exception:
+        return True
+
+from utils.protecao_janela import check_e_acionar_protecao
+from utils.status_snapshot import snapshot_status, formatar_status
+from utils.mt5_watchdog import garantir_conexao_mt5 as watchdog_conexao
+from utils.healthcheck import run_healthcheck_once
+from utils.estado_execucao import tick_estado, tempo_restante_minutos, carregar_estado, deve_notificar_cooldown, registrar_notificacao_cooldown
 from utils.lote_adaptativo import calcular_lote_adaptativo
+from utils.vote_monitor import obter_multiplicador_lote_por_vies
 from comunicacao.telegram_alertas import enviar_telegram
 from comunicacao.telegram_bot import (
     checar_comando, ler_comando_telegram, setar_comando_telegram
@@ -45,6 +59,7 @@ from utils.protecao_loss_flutuante import (
 from utils.horario_operacional import dentro_horario_operacao
 from utils.meta_diaria import atingiu_meta_periodo
 from utils.validador_robo import registrar_acao, validar_pendentes
+from utils.tempo_ciclo import TempoCiclo
 
 init(autoreset=True)
 
@@ -71,20 +86,46 @@ def _tf_to_minutes(tf: str) -> int:
         if tf.endswith("D") or tf.endswith("DAY") or tf.endswith("DIA") or tf.endswith("DIAS"):
             n = int("".join(ch for ch in tf if ch.isdigit()))
             return max(1, n * 60 * 24)
-        # fallback ao mapa conhecido
-        return int(TIMEFRAME_MAP.get(tf, 1))
+        # fallback: 1 minuto
+        return 1
     except Exception:
         return 1
 
 
 db_path = os.path.join("dados", "robodados.duckdb")
+# ⬇️ Mudança: timestamp agora desejado como TIMESTAMPTZ (evita erro VARCHAR vs TIMESTAMPTZ)
 colunas_necessarias = {
-    "id": "BIGINT", "timestamp": "VARCHAR", "ativo": "VARCHAR", "padrao": "VARCHAR",
+    "id": "BIGINT", "timestamp": "TIMESTAMPTZ", "ativo": "VARCHAR", "padrao": "VARCHAR",
     "regime": "VARCHAR", "contexto": "VARCHAR", "hora": "VARCHAR", "tipo": "VARCHAR",
     "volume": "FLOAT", "preco_abertura": "FLOAT", "preco_fechamento": "FLOAT",
     "score_reforco": "FLOAT", "motivo_saida": "VARCHAR", "sinal": "VARCHAR", "data_fechamento": "TIMESTAMP"
 }
 garantir_schema_operacoes(db_path, colunas_necessarias)
+
+# Migração defensiva: se 'operacoes.timestamp' ainda for VARCHAR, tentar converter para TIMESTAMPTZ
+def _migrar_timestamp_operacoes_para_timestamptz(caminho_db: str):
+    try:
+        import duckdb  # usado só aqui
+        con = duckdb.connect(caminho_db)
+        tipo = con.execute("""
+            SELECT UPPER(data_type)
+            FROM information_schema.columns
+            WHERE table_name = 'operacoes' AND column_name = 'timestamp'
+        """).fetchone()
+        if tipo and "VARCHAR" in (tipo[0] or ""):
+            # tenta converter automaticamente; valores inválidos viram NULL (TRY_CAST)
+            con.execute("""
+                ALTER TABLE operacoes
+                ALTER COLUMN "timestamp" TYPE TIMESTAMPTZ
+                USING TRY_CAST("timestamp" AS TIMESTAMPTZ)
+            """)
+            log_event("[DB] Migração: 'operacoes.timestamp' convertido para TIMESTAMPTZ.", level="info")
+        con.close()
+    except Exception as e:
+        # não interrompe o robô por falha de migração
+        log_event(f"[DB] Migração opcional do timestamp falhou (seguindo mesmo assim): {e}", level="warning")
+
+_migrar_timestamp_operacoes_para_timestamptz(db_path)
 
 # --- helper para extrair volume usado no envio ---
 def _extrair_volume_usado(resultado, ativo):
@@ -130,13 +171,8 @@ def _obter_score_e_n_compat(padrao: str, ativo: str):
         from inteligencia.ranking_padroes import obter_score_e_n  # type: ignore
         try:
             score2, n = obter_score_e_n(padrao, ativo)  # espera (float, int)
-            if score in (None, np.nan):
-                score = float(score2)
-            else:
-                # Se ambas vierem, prioriza a mais "realista"
-                score = float(score2)
+            score = float(score2)
         except Exception:
-            # se a função existe mas falhou, mantém score e n=None
             pass
     except Exception:
         pass
@@ -147,26 +183,82 @@ def _obter_score_e_n_compat(padrao: str, ativo: str):
         score = 0.0
     return score, (int(n) if n is not None else None)
 
+
+# === Helpers de STATUS/Telegram sempre-on (adicionados; sem dependências de variáveis locais) ===
+def _snapshot_bloqueios_e_metricas():
+    """Snapshot mínimo para o comando 'status' sem depender de variáveis locais."""
+    try:
+        flags = {
+            "feriado": eh_feriado() if 'eh_feriado' in globals() else None,
+            "loss_diario": esta_bloqueado_loss() if 'esta_bloqueado_loss' in globals() else None,
+            "loss_flutuante": esta_bloqueado_loss_flutuante() if 'esta_bloqueado_loss_flutuante' in globals() else None,
+            "meta_diaria": (atingiu_meta_periodo()[0] if 'atingiu_meta_periodo' in globals() else None),
+            "fora_horario": None,
+        }
+        metrica = {"posicoes_totais": None, "posicoes_por_ativo": "", "saldo": None}
+        try:
+            if 'saldo_bruto' in globals():
+                metrica["saldo"] = saldo_bruto()
+        except Exception:
+            pass
+        return flags, metrica
+    except Exception as e:
+        return {"erro": str(e)}, {}
+
+def processar_comandos_telegram_sempre():
+    """Responde 'status'/'motivo'/'resumo' mesmo durante bloqueios/esperas."""
+    try:
+        checar_comando()
+        cmd = ler_comando_telegram()
+    except Exception:
+        cmd = None
+    if not cmd:
+        return
+    c = str(cmd).strip().lower()
+    try:
+        if c in ("status", "resumo", "motivo", "heartbeat"):
+            snap = snapshot_status()
+            txt = formatar_status(snap, compacto=(c=="heartbeat"))
+            try:
+                enviar_telegram(txt)
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            enviar_telegram(f"[STATUS] Falha ao gerar resumo: {e}")
+        except Exception:
+            pass
+
 def garantir_conexao_mt5(intervalo_reconexao=5):
-    if mt5.initialize():
-        msg_ok = "✅ Reconexão com o MetaTrader 5 estabelecida! Retomando operação."
-        print(Fore.GREEN + msg_ok + Style.RESET_ALL)
-        log_event(msg_ok, level="info")
-        return True
-    else:
-        while not mt5.initialize():
-            msg = f"❌ Perda de conexão com o MetaTrader 5! Tentando reconectar em {intervalo_reconexao} min..."
-            print(Fore.RED + msg + Style.RESET_ALL)
-            log_event(msg, level="critical")
-            try: enviar_telegram(msg)
-            except: pass
-            time.sleep(intervalo_reconexao * 60)
-        msg_ok = "✅ Reconexão com o MetaTrader 5 estabelecida! Retomando operação."
-        print(Fore.GREEN + msg_ok + Style.RESET_ALL)
-        log_event(msg_ok, level="info")
-        try: enviar_telegram(msg_ok)
-        except: pass
-        return True
+    """Wrapper simples para manter compatibilidade com o watchdog, se existir."""
+    try:
+        # Prefira watchdog se disponível
+        return watchdog_conexao(intervalo_reconexao=intervalo_reconexao)
+    except Exception:
+        # Fallback local
+        if mt5.initialize():
+            msg_ok = "✅ Reconexão com o MetaTrader 5 estabelecida! Retomando operação."
+            print(Fore.GREEN + msg_ok + Style.RESET_ALL)
+            log_event(msg_ok, level="info")
+            return True
+        else:
+            while not mt5.initialize():
+                msg = f"❌ Perda de conexão com o MetaTrader 5! Tentando reconectar em {intervalo_reconexao} min..."
+                print(Fore.RED + msg + Style.RESET_ALL)
+                log_event(msg, level="critical")
+                try:
+                    enviar_telegram(msg)
+                except Exception:
+                    pass
+                time.sleep(intervalo_reconexao * 60)
+            msg_ok = "✅ Reconexão com o MetaTrader 5 estabelecida! Retomando operação."
+            print(Fore.GREEN + msg_ok + Style.RESET_ALL)
+            log_event(msg_ok, level="info")
+            try:
+                enviar_telegram(msg_ok)
+            except Exception:
+                pass
+            return True
 
 def ja_sincronizou_hoje():
     controle_path = "dados/ultimo_sync_historico.txt"
@@ -276,8 +368,10 @@ def main():
         alerta = "❌ Modelo de IA (cerebro_mestre.joblib) não encontrado! Treine antes de rodar!"
         print(Fore.RED + alerta + Style.RESET_ALL)
         log_event(alerta, level="error")
-        try: enviar_telegram(alerta)
-        except Exception as e: log_event(f"Falha ao enviar alerta de falta de modelo ao Telegram: {e}", level="error")
+        try:
+            enviar_telegram(alerta)
+        except Exception as e:
+            log_event(f"Falha ao enviar alerta de falta de modelo ao Telegram: {e}", level="error")
         return
 
     ciclo_num = 0
@@ -286,12 +380,24 @@ def main():
 
     try:
         while True:
+
+            tc = TempoCiclo()
+            tc.iniciar_ciclo()
             ciclo_t0 = time.perf_counter()  # início do ciclo (monotônico)
             operou = False
+
+            # === Telegram: responde comandos SEMPRE, início do ciclo ===
+            try:
+                processar_comandos_telegram_sempre()
+            except Exception:
+                pass
             bloqueios_status = {}
 
-            timeframe_min = min([ _tf_to_minutes(timeframes.get(a, 'M1')) for a in ativos ])
+            timeframe_min = min([_tf_to_minutes(timeframes.get(a, 'M1')) for a in ativos])
+            tc.iniciar_espera()
             aguardar_inicio_novo_candle(timeframe_min)
+            tc.finalizar_espera()
+
             garantir_conexao_mt5(intervalo_reconexao_mt5)
 
             # BLOQUEIOS INSTITUCIONAIS
@@ -301,7 +407,23 @@ def main():
             atingiu_meta_flag, tipo_meta, _ = atingiu_meta_periodo()
             bloqueios_status['meta_diaria'] = atingiu_meta_flag
             bloqueios_status['fora_horario'] = not dentro_horario_operacao(horarios_operacao)
-            bloqueios_status['risco_ftmo'] = not all([verificar_risco(a) for a in ativos])
+
+            # ⬇️ Hotfix: agregador defensivo para risco FTMO (não trava se houver erro na query DuckDB)
+            try:
+                risco_ok_agg = True
+                for _a in ativos:
+                    try:
+                        if not verificar_risco(_a):
+                            risco_ok_agg = False
+                            break
+                    except Exception as e:
+                        log_event(f"[RISCO] Erro ao verificar risco FTMO (agregador) para {_a}: {e}", level="error")
+                        # não bloqueia por falha; o check detalhado por-ativo acontece adiante
+                        continue
+                bloqueios_status['risco_ftmo'] = not risco_ok_agg
+            except Exception as e:
+                log_event(f"[RISCO] Falha no agregador de risco FTMO: {e}", level="error")
+                bloqueios_status['risco_ftmo'] = False
 
             # Log técnico bruto (JSON)
             import json
@@ -318,8 +440,10 @@ def main():
                 _log_bloqueio("-", ciclo_num, "feriado")
                 msg = "Robô pausado por feriado. Nenhuma operação será realizada hoje."
                 log_event(msg, level="warning")
-                try: enviar_telegram("⏸️ " + msg)
-                except: pass
+                try:
+                    enviar_telegram("⏸️ " + msg)
+                except Exception:
+                    pass
                 agora = datetime.now()
                 amanha = (agora + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
                 time.sleep((amanha - agora).total_seconds())
@@ -341,8 +465,10 @@ def main():
                                 f"10 minutos antes do mercado encerrar."
                             )
                             log_event(msg, level="warning")
-                            try: enviar_telegram(msg)
-                            except: pass
+                            try:
+                                enviar_telegram(msg)
+                            except Exception:
+                                pass
                         fechamento_sexta_realizado = True
                 else:
                     fechamento_sexta_realizado = False
@@ -360,7 +486,8 @@ def main():
                     enviar_telegram(
                         f"⏸️ Mercado fechado. Próxima checagem de abertura em {intervalo_checagem_mercado_fechado} min."
                     )
-                except: pass
+                except Exception:
+                    pass
                 time.sleep(intervalo_checagem_mercado_fechado * 60)
                 continue
 
@@ -368,12 +495,17 @@ def main():
             if esta_bloqueado_loss():
                 _log_bloqueio("-", ciclo_num, "bloqueio_loss_diario")
                 log_event("Robô bloqueado por proteção de loss diário. Aguardando virar o dia para retomar.", level="warning")
-                try: enviar_telegram("⚠️ Robô em modo de proteção: atingido o limite de loss diário. Só irá operar novamente amanhã.")
-                except: pass
-                while esta_bloqueado_loss(): time.sleep(120)
+                try:
+                    enviar_telegram("⚠️ Robô em modo de proteção: atingido o limite de loss diário. Só irá operar novamente amanhã.")
+                except Exception:
+                    pass
+                while esta_bloqueado_loss():
+                    time.sleep(120)
                 log_event("Proteção de loss diário liberada, retomando operação.", level="info")
-                try: enviar_telegram("Robô liberado após proteção de loss diário. Retomando operação.")
-                except: pass
+                try:
+                    enviar_telegram("Robô liberado após proteção de loss diário. Retomando operação.")
+                except Exception:
+                    pass
                 continue
 
             # --- HARD STOP por perda do dia ---
@@ -383,7 +515,8 @@ def main():
                 log_event(f"Proteção HARD ativada: perda do dia = {perda_dia:.2f} <= limite {limite_loss_dia:.2f}. Fechando tudo e hibernando...", level="critical")
                 try:
                     enviar_telegram(f"🚨 Proteção HARD: Perda do dia = {perda_dia:.2f} <= limite {limite_loss_dia:.2f}. Todas as ordens serão fechadas e o robô será hibernado até amanhã.")
-                except: pass
+                except Exception:
+                    pass
                 total_fechadas = fechar_todas_ordens(ativos, motivo="Fechamento automático por atingimento do loss diário")
                 bloquear_entradas_loss()
                 log_event(f"Total de ordens fechadas por proteção: {total_fechadas}", level="critical")
@@ -395,12 +528,17 @@ def main():
             if esta_bloqueado_loss_flutuante():
                 _log_bloqueio("-", ciclo_num, "bloqueio_loss_flutuante")
                 log_event("Robô bloqueado por proteção de loss flutuante (simultâneo em aberto). Aguardando virar o dia para retomar.", level="warning")
-                try: enviar_telegram("⚠️ Robô em proteção: atingiu o limite de ordens abertas em prejuízo simultâneo. Só irá operar novamente amanhã.")
-                except: pass
-                while esta_bloqueado_loss_flutuante(): time.sleep(120)
+                try:
+                    enviar_telegram("⚠️ Robô em proteção: atingiu o limite de ordens abertas em prejuízo simultâneo. Só irá operar novamente amanhã.")
+                except Exception:
+                    pass
+                while esta_bloqueado_loss_flutuante():
+                    time.sleep(120)
                 log_event("Proteção de loss flutuante liberada, retomando operação.", level="info")
-                try: enviar_telegram("Robô liberado após proteção de loss flutuante. Retomando operação.")
-                except: pass
+                try:
+                    enviar_telegram("Robô liberado após proteção de loss flutuante. Retomando operação.")
+                except Exception:
+                    pass
                 continue
 
             # --- HARD STOP por loss flutuante (atingido agora) ---
@@ -410,7 +548,8 @@ def main():
                 log_event(f"PROTEÇÃO ativada: {qtd_loss} ordens simultâneas abertas em prejuízo! Fechando todas e bloqueando robô.", level="critical")
                 try:
                     enviar_telegram(f"🚨 PROTEÇÃO FLUTUANTE: {qtd_loss} ordens abertas em prejuízo! Todas serão fechadas e robô hibernado até amanhã.\nTickets: {tickets_loss}")
-                except: pass
+                except Exception:
+                    pass
                 total_fechadas = fechar_todas_ordens(ativos, motivo="Fechamento automático por proteção de loss flutuante")
                 bloquear_loss_flutuante()
                 log_event(f"Total de ordens fechadas por proteção flutuante: {total_fechadas}", level="critical")
@@ -424,12 +563,16 @@ def main():
                 _log_bloqueio("-", ciclo_num, f"meta_{tipo_meta}_atingida", percentual=f"{pct:.2f}%")
                 if tipo_meta == "gain":
                     log_event(f"Meta de ganho diário atingida ({pct:.2f}%). Pausando operações até amanhã.", level="critical")
-                    try: enviar_telegram(f"🏆 Meta de GAIN diário atingida ({pct:.2f}%). Robô pausado até amanhã!")
-                    except: pass
+                    try:
+                        enviar_telegram(f"🏆 Meta de GAIN diário atingida ({pct:.2f}%). Robô pausado até amanhã!")
+                    except Exception:
+                        pass
                 elif tipo_meta == "loss":
                     log_event(f"Meta de loss diário atingida ({pct:.2f}%). Pausando operações até amanhã.", level="critical")
-                    try: enviar_telegram(f"🚨 Meta de LOSS diário atingida ({pct:.2f}%). Robô pausado até amanhã!")
-                    except: pass
+                    try:
+                        enviar_telegram(f"🚨 Meta de LOSS diário atingida ({pct:.2f}%). Robô pausado até amanhã!")
+                    except Exception:
+                        pass
                 while True:
                     agora = datetime.now()
                     if agora.hour == 0:
@@ -442,16 +585,20 @@ def main():
                 _log_bloqueio("-", ciclo_num, "fora_horario_operacional")
                 if not fora_horario_notificado:
                     log_event("Fora do horário operacional. Aguardando janela de operação...", level="info")
-                    try: enviar_telegram("⏸️ Fora do horário operacional. Robô aguardando janela permitida para operar.")
-                    except: pass
+                    try:
+                        enviar_telegram("⏸️ Fora do horário operacional. Robô aguardando janela permitida para operar.")
+                    except Exception:
+                        pass
                     fora_horario_notificado = True
                 time.sleep(60)
                 continue
             else:
                 if fora_horario_notificado:
                     log_event("Dentro do horário operacional. Robô retomando operações.", level="info")
-                    try: enviar_telegram("▶️ Dentro do horário operacional. Robô retomando operações.")
-                    except: pass
+                    try:
+                        enviar_telegram("▶️ Dentro do horário operacional. Robô retomando operações.")
+                    except Exception:
+                        pass
                     fora_horario_notificado = False
 
             # --- SYNC de madrugada ---
@@ -524,7 +671,7 @@ def main():
                         regime = "indefinido"
                         log_event(f"Erro ao detectar regime para {ativo}: {e} (CICLO {ciclo_num})", level="error")
 
-                    # --- Risco FTMO por ativo ---
+                    # --- Risco FTMO por ativo (já defensivo) ---
                     try:
                         if not verificar_risco(ativo):
                             _log_bloqueio(ativo, ciclo_num, "risco_ftmo")
@@ -533,6 +680,7 @@ def main():
                             ciclo_info_log[f"{ativo}_status"] = "bloqueado_risco"
                             continue
                     except Exception as e:
+                        # Apenas loga o erro e segue — não bloqueia por falha de verificação
                         log_event(f"Erro ao verificar risco para {ativo}: {e} (CICLO {ciclo_num})", level="error")
 
                     # --- Contexto ---
@@ -727,18 +875,44 @@ def main():
                             }
                             continue
 
-
                         # --- Cálculo de volume e envio de ordem ---
                         saldo_atual = saldo_b
                         volatilidade = candles_feat["close"].std() if not candles_feat.empty else 1.0
 
-                        # Passa a confiança no contexto para o executor calcular o lote (piso/teto do config)
+                        # Confianca para execução
                         confianca_exec = max(0.0, min(1.0, float(resultado_sinal.get("confianca", 0.5))))
+
+                        # Limite de exposição por ativo
+                        max_por_ativo = int(config.get('protecao', {}).get('max_posicoes_por_ativo', 1))
+                        if not _pode_abrir_nova_posicao(ativo, max_por_ativo):
+                            log_event(f"[EXPOSICAO] Limite atingido para {ativo}: max {max_por_ativo} posições. Sinal ignorado.", level="info")
+                            try:
+                                enviar_telegram(f"ℹ️ Limite de exposição: não abri nova posição em {ativo} (max={max_por_ativo}).")
+                            except Exception:
+                                pass
+                            continue  # <-- importante: nada a fazer se não pode abrir
+
+                        # --- Lote adaptativo + redução por viés (Fase 7) ---
+                        try:
+                            volume_base = calcular_lote_adaptativo(
+                                ativo, saldo_atual, volatilidade, confianca_exec, config
+                            )
+                        except Exception:
+                            volume_base = float(config.get('volumes', {}).get(ativo, config.get('volume_padrao', 0.01)))
+                        try:
+                            mult_vies = float(obter_multiplicador_lote_por_vies(ativo, config))
+                        except Exception:
+                            mult_vies = 1.0
+                        volume_final = max(0.01, float(volume_base) * float(mult_vies))
+
+                        # Contexto que segue no registro institucional
                         ctx_exec = {
                             "regime": regime,
                             "contexto": contexto,
                             "hora": time.strftime("%H:%M:%S"),
                             "confianca": confianca_exec,
+                            "mult_vies": mult_vies,
+                            "volume_base": volume_base,
                             # Se quiser que o lote também reflita o score_total ajustado, descomente:
                             # "score_total": max(0.0, min(1.0, (score_total_ajust + 1.0) / 2.0)),
                         }
@@ -749,10 +923,10 @@ def main():
                         if isinstance(timestamp_inicio_candle, str):
                             try:
                                 timestamp_inicio_candle = datetime.fromisoformat(timestamp_inicio_candle)
-                            except:
+                            except Exception:
                                 timestamp_inicio_candle = timestamp_execucao
 
-                        # Delay de execução (volume "auto", pois será definido no executor)
+                        # Delay de execução (registrar com lote "auto" — quem define é o executor)
                         log_delay_execucao(
                             timestamp_inicio_candle=timestamp_inicio_candle,
                             timestamp_execucao_ordem=timestamp_execucao,
@@ -761,11 +935,11 @@ def main():
                             info_extra=f"sinal={sinal_traduzido}, volume=auto"
                         )
 
-                        # Deixe o executor calcular o volume (piso/teto + logs)
+                        # Envio da ordem
                         resultado = abrir_ordem_e_registrar(
                             ativo=ativo,
                             tipo=sinal_traduzido,
-                            volume=None,  # volume calculado no executor (usa utils.lote_adaptativo)
+                            volume=volume_final,  # volume adaptativo * multiplicador de viés
                             timestamp=candles_feat.iloc[-1]["timestamp"],
                             preco_abertura=preco_abertura,
                             contexto=ctx_exec,
@@ -784,13 +958,15 @@ def main():
                         ciclo_info_log[f"{ativo}_ordem"] = {
                             "ticket": ticket,
                             "retcode": retcode,
-                            "comment": comment,
                             "sinal": sinal_traduzido,
                             "volume": volume_field,
+                            "volume_base": volume_base,
+                            "mult_vies": mult_vies,
                             "timestamp": candles_feat.iloc[-1]["timestamp"],
                             "preco_abertura": preco_abertura,
                             "padrao": padrao,
-                            "score_total": score_total_ajust
+                            "score_total": score_total_ajust,
+                            "comment": comment,
                         }
 
                         campos_essenciais = ["ticket", "retcode", "sinal", "volume", "preco_abertura", "padrao", "score_total"]
@@ -814,6 +990,8 @@ def main():
                                         "padrao": padrao,
                                         "tipo": sinal_traduzido,
                                         "volume": volume_field,
+                                        "volume_base": volume_base,
+                                        "mult_vies": mult_vies,
                                         "retcode": retcode,
                                         "ticket": ticket,
                                         "lucro": 0
@@ -909,6 +1087,20 @@ def main():
                 log_event(f"[ERRO CRÍTICO] Exceção não tratada no ciclo {ciclo_num}: {e}", level="error")
                 time.sleep(30)
             finally:
+                try:
+                    tc.finalizar_ciclo()
+                    try:
+                        tc.logar(log_event, ciclo=ciclo_num)
+                    except Exception:
+                        pass
+                    try:
+                        if config.get("telemetria_tempo_ciclo_csv", False):
+                            tc.salvar_csv(ciclo=ciclo_num)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
                 # Medição confiável do tempo de ciclo
                 try:
                     dur = time.perf_counter() - ciclo_t0
@@ -921,7 +1113,7 @@ def main():
         log_event("[STOP] Execução interrompida pelo usuário.", level="warning")
         try:
             enviar_telegram("🛑 Robô FTMO INSTITUCIONAL interrompido manualmente.")
-        except:
+        except Exception:
             pass
 
 if __name__ == "__main__":

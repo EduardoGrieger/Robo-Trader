@@ -10,6 +10,7 @@ from utils.sinal_utils import normalizar_sinal, sinal_to_str
 from utils.thresholds import carregar_thresholds, arquivo_stale
 from inteligencia.ranking_padroes import obter_score_padrao
 from inteligencia.modo_sniper import detectar_sniper  # ⬅️ GATE SNIPER (configurável)
+from utils.vote_monitor import registrar_voto
 
 # Suporte para deep learning e XGBoost
 try:
@@ -210,7 +211,7 @@ def preprocessar_features(df, nome_modelo):
             # sem lista: usa numéricas como você já fazia
             df_align = df_num
 
-        # 4) tail(1) + limpeza (sem FutureWarning)
+        # 4) tail(1) + limpeza (ffill/bfill compatível com novas versões do pandas)
         df_align = df_align.tail(1).copy()
         df_align = (
             df_align.ffill()
@@ -353,7 +354,7 @@ def fallback_tecnico(df, contexto_decisao):
         saida = {
             "timestamp": df["timestamp"].iloc[-1] if "timestamp" in df.columns else "",
             "sinal": sinal,
-            "padrao": "sem_padrao",
+            "padrao": "Fallback Técnico",
             "motivo": "Sem coluna close",
             "confianca": 0.5,
             "regime": contexto_decisao.get("regime", "neutro"),
@@ -382,7 +383,8 @@ def fallback_tecnico(df, contexto_decisao):
 
     df["sinal"] = df.apply(decisao, axis=1).apply(normalizar_sinal)
     ultimo_sinal = df.loc[df.index[-1], "sinal"]
-    contexto_decisao["padrao"] = "sem_padrao"
+    padrao_fallback = "Fallback Técnico"
+    contexto_decisao["padrao"] = padrao_fallback
     contexto_decisao["confianca"] = 0.5
     contexto_decisao["motivo"] = f"Sinal técnico padrão ({sinal_to_str(ultimo_sinal)})"
     salvar_log(df, "dados/sinais_gerados_fallback.csv")
@@ -437,20 +439,11 @@ def gerar_sinal(df_candles, ativo, contexto=None):
     votos = []
     motivos = []
 
-    # Ranking de padrão (interpretação) — ROBUSTO
+    # Ranking de padrão (interpretação)
     try:
-        r = obter_score_padrao(df.tail(50))
-        if isinstance(r, tuple) and len(r) >= 2:
-            contexto_decisao["padrao"], contexto_decisao["padrao_score"] = r[0], float(r[1])
-        elif isinstance(r, str):
-            contexto_decisao["padrao"], contexto_decisao["padrao_score"] = r, 0.0
-        elif isinstance(r, (int, float, np.floating)):
-            contexto_decisao["padrao"], contexto_decisao["padrao_score"] = "interpretacao", float(r)
-        else:
-            contexto_decisao["padrao"], contexto_decisao["padrao_score"] = "sem_padrao", 0.0
+        contexto_decisao["padrao"], contexto_decisao["padrao_score"] = obter_score_padrao(df.tail(50))
     except Exception as e:
         log_event(f"[PADRAO] não foi possível calcular: {e}", level="warning")
-        contexto_decisao["padrao"], contexto_decisao["padrao_score"] = "sem_padrao", 0.0
 
     # Para cada modelo configurado e carregado
     for nome, info in modelos_cfg.items():
@@ -511,9 +504,6 @@ def gerar_sinal(df_candles, ativo, contexto=None):
     # Se não houve votos válidos → fallback
     if not votos:
         log_event(f"Nenhuma previsão válida dos modelos (motivos: {';'.join(motivos) if motivos else '—'}). Usando fallback técnico.", level="warning")
-        # garante padrao string no fallback
-        if not isinstance(contexto_decisao.get("padrao"), str) or not contexto_decisao.get("padrao"):
-            contexto_decisao["padrao"] = "sem_padrao"
         return fallback_tecnico(df, contexto_decisao)
 
     # ## SNIPER scoring (não-invasivo)
@@ -599,10 +589,6 @@ def gerar_sinal(df_candles, ativo, contexto=None):
         contexto_decisao["confianca"] = 0.5
     contexto_decisao["motivo"] = (contexto_decisao.get("motivo", "") + f" | votos={padrao_nome}").strip(" |")
 
-    # Garante padrao string
-    if not isinstance(contexto_decisao.get("padrao"), str) or not contexto_decisao.get("padrao"):
-        contexto_decisao["padrao"] = "sem_padrao"
-
     saida = {
         "timestamp": df["timestamp"].iloc[-1] if "timestamp" in df.columns else "",
         "sinal": int(normalizar_sinal(sinal_final)),
@@ -614,6 +600,10 @@ def gerar_sinal(df_candles, ativo, contexto=None):
         "tp_sl_priority": "SL",
     }
     sanity_check_sinal(saida)
+    try:
+        registrar_voto(ativo, int(normalizar_sinal(sinal_final)), config)
+    except Exception as _e:
+        log_event(f"[VOTE_MONITOR] falha ao registrar voto: {_e}", level="warning")
     return saida
 
 

@@ -301,3 +301,53 @@ __all__ = [
     "set_log_level",
     "get_log_level",
 ]
+
+
+# ====== Heartbeat de proteção (1 linha/h ou período custom) ======
+def log_protecao_heartbeat_if_due(periodo_min: int = 60) -> bool:
+    """
+    Emite 1 linha de log periódica durante bloqueio, com estado compacto.
+    Usa utils.estado_execucao.deve_emitir_heartbeat().
+    Retorna True se logou; False se não era devido.
+    """
+    try:
+        from utils.estado_execucao import carregar_estado, deve_emitir_heartbeat  # import tardio p/ evitar ciclos
+        st = carregar_estado() or {}
+        if not st.get("bloqueado"):
+            return False
+        if not callable(deve_emitir_heartbeat):
+            return False
+        if not deve_emitir_heartbeat(periodo_min=periodo_min):
+            return False
+        compact = {
+            "motivo": st.get("motivo"),
+            "since": st.get("blocked_since") or st.get("inicio"),
+            "until": st.get("blocked_until") or st.get("fim"),
+            "tickets": st.get("tickets_afetados") or st.get("tickets") or [],
+        }
+        log_event(f"[PROTECAO/HEARTBEAT] {compact}", level="info", modulo="protecao")
+        return True
+    except Exception as e:
+        log_event(f"[PROTECAO/HEARTBEAT] Falha ao emitir heartbeat: {e}", level="warning", modulo="protecao")
+        return False
+
+
+# ====== Log de saída do bloqueio ======
+def log_protecao_exit(resumo: dict | None = None) -> None:
+    """
+    Bloco final padronizado ao sair de proteção.
+    resumo: dicionário opcional com métricas (duracao_min, pnl_recuperado, tickets, etc).
+    """
+    try:
+        from utils.estado_execucao import carregar_estado
+        st = carregar_estado() or {}
+        base = {
+            "motivo": st.get("motivo"),
+            "since": st.get("blocked_since") or st.get("inicio"),
+            "until": st.get("blocked_until") or st.get("fim"),
+        }
+        if isinstance(resumo, dict):
+            base.update(resumo)
+        log_event(f"[PROTECAO/EXIT] {base}", level="info", modulo="protecao")
+    except Exception as e:
+        log_event(f"[PROTECAO/EXIT] Falha ao montar resumo: {e}", level="warning", modulo="protecao")

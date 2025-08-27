@@ -1,16 +1,16 @@
 {
-  "timestamp": "20250824_1945",
+  "timestamp": "20250825_2232",
   "acc_min_promocao": 0.55,
   "random_forest": {
-    "acc": 0.4092222222222222,
+    "acc": 0.5058,
     "promover": false
   },
   "xgboost": {
-    "acc": 0.6688888888888889,
+    "acc": 0.7138,
     "promover": true
   },
   "lstm": {
-    "acc": 0.7972777777777778,
+    "acc": 0.7956,
     "promover": true
   }
 }

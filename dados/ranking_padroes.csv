@@ -2,4 +2,4 @@ ativo,padrao,acertos,erros,neutros,total
 nan,compra_tendencia_manha,0,0,0,0
 nan,venda_lateral_noite,0,0,0,0
 nan,neutro,0,0,0,0
-EURUSD,sem_sinal_indefinido_sem_contexto,1,4,0,5
+EURUSD,sem_sinal_indefinido_sem_contexto,2,5,0,7
