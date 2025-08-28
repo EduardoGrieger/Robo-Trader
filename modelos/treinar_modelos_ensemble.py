@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import joblib
 from datetime import datetime
+import random
 
 # Global config placeholder (overwritten later in main)
 cfg = {}
@@ -23,8 +24,10 @@ except ImportError:
 # LSTM
 try:
     from tensorflow import keras
+    import tensorflow as tf
 except ImportError:
     keras = None
+    tf = None
 
 # Oversampling e Undersampling (opcional; não usamos SMOTE pra evitar vazamento)
 try:
@@ -36,6 +39,26 @@ except ImportError:
     RandomUnderSampler = None
 
 from utils.debug_logger import log_event
+
+
+# ========================= SEED / DETERMINISMO =========================
+
+def set_global_seed(seed: int = 42):
+    """Define seeds em random, numpy e tensorflow (se disponível)."""
+    try:
+        random.seed(seed)
+    except Exception:
+        pass
+    try:
+        np.random.seed(seed)
+    except Exception:
+        pass
+    if tf is not None:
+        try:
+            tf.random.set_seed(seed)
+        except Exception:
+            pass
+    log_event(f"[SEED] Global seed configurado para {seed}", level="info")
 
 
 # ========================= UTIL & DIAGNÓSTICOS =========================
@@ -71,6 +94,7 @@ def carregar_dados(features_path):
         return None
     df = pd.read_csv(features_path)
     diagnosticar_features(df, "[TREINO ANTES]")
+    # Mantemos um fillna inicial leve (compat), mas faremos IMPUTAÇÃO PÓS-SPLIT com medianas do treino.
     df = df.fillna(df.median(numeric_only=True))
     if "sinal" not in df.columns:
         log_event("❌ Coluna 'sinal' não encontrada no features.csv.", level="error")
@@ -100,7 +124,7 @@ def adicionar_meta_features(df):
         )
     if ok_close and ok_h and ok_l:
         roll_mean = df["close"].rolling(20).mean()
-        df["range_ratio"] = (df["high"] - df["low"]) / roll_mean
+        df["range_ratio"] = (df["high"] - df["low"]) / (roll_mean.replace(0, np.nan))
 
     return df
 
@@ -392,10 +416,107 @@ def _salvar_avaliacao_ensemble(metrics_dict):
     log_event(f"[AVALIACAO] Arquivo salvo em {path_modelos} e {path_logs}", level="info")
 
 
+# ========================= IMPUTAÇÃO PÓS-SPLIT =========================
+
+def imputar_pos_split(X_train, X_val, X_test):
+    """
+    Calcula medianas **somente no treino** e aplica em val/test para evitar vazamento.
+    Mantém DataFrames e colunas originais.
+    """
+    X_train = X_train.copy()
+    X_val = X_val.copy()
+    X_test = X_test.copy()
+
+    med_train = X_train.median(numeric_only=True)
+    num_cols = med_train.index.tolist()
+
+    X_train[num_cols] = X_train[num_cols].fillna(med_train)
+    X_val[num_cols] = X_val[num_cols].fillna(med_train)
+    X_test[num_cols] = X_test[num_cols].fillna(med_train)
+
+    return X_train, X_val, X_test, med_train.to_dict()
+
+
+# ========================= LÓGICA DE PROMOÇÃO =========================
+
+def _promover_melhor_modelo(avaliacao, modelos, features_ref):
+    """
+    Escolhe o melhor modelo entre RF/XGB (compatível com joblib) e salva em
+    'modelos/cerebro_mestre.joblib'. LSTM é ignorado por compatibilidade.
+    """
+    permitir_promocao = bool(cfg.get("promover_melhor_modelo", True))
+    permitir_lstm = bool(cfg.get("permitir_promocao_lstm", False))  # por padrão, False
+    escolhido = {"tipo": "rf", "acc": None}
+
+    if not permitir_promocao:
+        # Compat: mantém RF como 'cerebro_mestre'
+        try:
+            joblib.dump(modelos.get("rf"), "modelos/cerebro_mestre.joblib")
+            log_event("[PROMOCAO] Promoção desabilitada. RF salvo como cerebro_mestre.", level="info")
+        except Exception as e:
+            log_event(f"[PROMOCAO] Falha ao salvar RF como cerebro_mestre: {e}", level="error")
+        return {"tipo": "rf", "acc": avaliacao.get("random_forest", {}).get("acc")}
+
+    # Monta ranking por acc
+    candidatos = []
+    if "random_forest" in avaliacao and modelos.get("rf") is not None:
+        candidatos.append(("rf", float(avaliacao["random_forest"].get("acc") or -1)))
+    if "xgboost" in avaliacao and modelos.get("xgb") is not None and avaliacao["xgboost"].get("acc") is not None:
+        candidatos.append(("xgb", float(avaliacao["xgboost"]["acc"])))
+
+    # LSTM não é joblib; só promove se explicitamente habilitado
+    if permitir_lstm and "lstm" in avaliacao and modelos.get("lstm") is not None and avaliacao["lstm"].get("acc") is not None:
+        candidatos.append(("lstm", float(avaliacao["lstm"]["acc"])))
+
+    if not candidatos:
+        log_event("[PROMOCAO] Nenhum candidato válido. Mantendo RF como cerebro_mestre.", level="warning")
+        try:
+            joblib.dump(modelos.get("rf"), "modelos/cerebro_mestre.joblib")
+        except Exception:
+            pass
+        return {"tipo": "rf", "acc": avaliacao.get("random_forest", {}).get("acc")}
+
+    candidatos.sort(key=lambda t: t[1], reverse=True)
+    best_tipo, best_acc = candidatos[0]
+    escolhido = {"tipo": best_tipo, "acc": best_acc}
+
+    if best_tipo == "rf":
+        joblib.dump(modelos["rf"], "modelos/cerebro_mestre.joblib")
+        log_event(f"[PROMOCAO] RF promovido a cerebro_mestre (acc={best_acc:.4f}).", level="info")
+    elif best_tipo == "xgb":
+        # tentar salvar em joblib para manter compat no main_loop
+        try:
+            joblib.dump(modelos["xgb"], "modelos/cerebro_mestre.joblib")
+            log_event(f"[PROMOCAO] XGB promovido a cerebro_mestre (acc={best_acc:.4f}).", level="info")
+        except Exception as e:
+            log_event(f"[PROMOCAO] Falha ao salvar XGB em joblib ({e}). Mantendo RF como cerebro_mestre.", level="warning")
+            joblib.dump(modelos["rf"], "modelos/cerebro_mestre.joblib")
+            escolhido = {"tipo": "rf", "acc": avaliacao.get("random_forest", {}).get("acc")}
+    else:
+        # LSTM: incompatível com joblib → não substitui o cerebro_mestre por padrão
+        log_event(f"[PROMOCAO] LSTM teve melhor acc ({best_acc:.4f}) mas não será promovido (compat).", level="warning")
+        joblib.dump(modelos["rf"], "modelos/cerebro_mestre.joblib")
+        escolhido = {"tipo": "rf", "acc": avaliacao.get("random_forest", {}).get("acc")}
+
+    # Persistir uma “ficha” do ensemble
+    ensemble_cfg = {
+        "cerebro_mestre_tipo": escolhido["tipo"],
+        "acc": escolhido["acc"],
+        "features_ref": list(features_ref) if features_ref is not None else None,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    with open("modelos/ensemble_config.json", "w", encoding="utf-8") as f:
+        json.dump(ensemble_cfg, f, ensure_ascii=False, indent=2)
+
+    return escolhido
+
+
 # ========================= MAIN =========================
 
 def main():
     global cfg
+
+    set_global_seed(42)
 
     features_path = "dados/features.csv"
     os.makedirs("modelos", exist_ok=True)
@@ -422,7 +543,7 @@ def main():
     # ---- meta-features (opcional)
     if usar_meta_features:
         df = adicionar_meta_features(df)
-        # preencher NaNs criados pelas janelas
+        # preencher NaNs criados pelas janelas (pré-split, leve)
         df = df.fillna(df.median(numeric_only=True))
 
     # ---- drops de colunas não-úteis p/ modeling
@@ -441,7 +562,7 @@ def main():
 
     log_event(f"Distribuição original: {y.value_counts().to_dict()}")
 
-    X = filtrar_apenas_numericas(X).fillna(0)
+    X = filtrar_apenas_numericas(X)
 
     if len(X) != len(y):
         log_event(f"❌ X e y desalinhados! X.shape={X.shape}, y.shape={y.shape}", level="error")
@@ -458,9 +579,12 @@ def main():
     val_size = int(0.15 * n)
     test_size = n - train_size - val_size
 
-    X_train, y_train = X.iloc[:train_size], y.iloc[:train_size]
-    X_val,   y_val   = X.iloc[train_size:train_size+val_size], y.iloc[train_size:train_size+val_size]
-    X_test,  y_test  = X.iloc[train_size+val_size:], y.iloc[train_size+val_size:]
+    X_train, y_train = X.iloc[:train_size].copy(), y.iloc[:train_size].copy()
+    X_val,   y_val   = X.iloc[train_size:train_size+val_size].copy(), y.iloc[train_size:train_size+val_size].copy()
+    X_test,  y_test  = X.iloc[train_size+val_size:].copy(), y.iloc[train_size+val_size:].copy()
+
+    # === IMPUTAÇÃO PÓS-SPLIT (sem vazamento) ===
+    X_train, X_val, X_test, med_train_dict = imputar_pos_split(X_train, X_val, X_test)
 
     # === Balanceamento avançado APENAS no treino ===
     max_neu = float(cfg.get("max_neutro_ratio_treino", 0.25))
@@ -475,13 +599,19 @@ def main():
 
     avaliacao = {
         "timestamp": timestamp,
-        "acc_min_promocao": acc_min_promocao
+        "acc_min_promocao": acc_min_promocao,
+        "imputacao_pos_split": True
     }
+
+    modelos = {"rf": None, "xgb": None, "lstm": None}
+    features_ref = list(X_train.columns)
 
     # =================== RandomForest =====================
     modelo_rf = treinar_rf(X_train, y_train)
+    modelos["rf"] = modelo_rf
     X_test_rf = preparar_para_previsao(X_test, "modelos/features_treinadas_rf.pkl")
     acc_rf, report_rf, cm_rf, y_pred_rf = avaliar_modelo(modelo_rf, X_test_rf, y_test, "rf")
+    # salvas (RF sempre salvo — compat)
     joblib.dump(modelo_rf, "modelos/cerebro_mestre.joblib")
     joblib.dump(modelo_rf, f"modelos/cerebro_mestre_{timestamp}.joblib")
     log_event(f"RandomForest treinado. Acc={acc_rf:.4f}", level="info")
@@ -508,6 +638,7 @@ def main():
             y_val_xgb = mapear_label_xgb(y_val)
             y_test_xgb = mapear_label_xgb(y_test)
             modelo_xgb = treinar_xgb(X_train, y_train_xgb, X_val, y_val_xgb)
+            modelos["xgb"] = modelo_xgb
             X_test_xgb = preparar_para_previsao(X_test, "modelos/features_treinadas_xgb.pkl")
             if X_test_xgb.shape[1] != X_train.shape[1]:
                 log_event(f"[XGB] Shape mismatch: X_test {X_test_xgb.shape}, X_train {X_train.shape}", level="error")
@@ -541,6 +672,7 @@ def main():
             X_val_lstm = X_val[features_lstm].values
             X_test_lstm = preparar_para_previsao(X_test, features_lstm).values
             modelo_lstm = treinar_lstm(X_train[features_lstm], y_train.values, X_val[features_lstm], y_val.values)
+            modelos["lstm"] = modelo_lstm
             acc_lstm, report_lstm, cm_lstm, y_pred_lstm = avaliar_modelo(modelo_lstm, X_test_lstm, y_test.values, "lstm")
             modelo_lstm.save("modelos/lstm_cerebro.h5")
             modelo_lstm.save(f"modelos/lstm_cerebro_{timestamp}.h5")
@@ -565,8 +697,20 @@ def main():
         log_event("Tensorflow/Keras não instalado. Pulando treino LSTM.", level="warning")
         avaliacao["lstm"] = {"acc": None, "promover": False, "erro": "keras_nao_instalado"}
 
+    # === promoção do melhor modelo (compat joblib) ===
+    escolhido = _promover_melhor_modelo(avaliacao, modelos, features_ref)
+    avaliacao["cerebro_mestre_escolhido"] = escolhido
+
     # === grava avaliação para o pipeline de promoção ===
     _salvar_avaliacao_ensemble(avaliacao)
+
+    # Persistir também as medianas do treino para referência/uso no pipeline
+    try:
+        with open("modelos/imputacao_medianas_treino.json", "w", encoding="utf-8") as f:
+            json.dump({k: float(v) for k, v in ({} if 'med_train_dict' not in locals() else med_train_dict).items()}, f, indent=2, ensure_ascii=False)
+        log_event("[IMPUTAÇÃO] Medianas do treino salvas em modelos/imputacao_medianas_treino.json", level="info")
+    except Exception as e:
+        log_event(f"[IMPUTAÇÃO] Falha ao salvar medianas do treino: {e}", level="warning")
 
     log_event("🏁 Treino dos modelos ensemble finalizado!", level="info")
 

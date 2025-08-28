@@ -33,7 +33,7 @@
     "GBPUSD": "M5"
   },
 
-  "janela_candles": 12000,
+  "janela_candles": 15000,
   "train_min": 1000,
   "min_folds": 2,
   "val_min": 300,
@@ -187,7 +187,6 @@
   "xgb_es_rounds": 50,
 
   "timezone_servidor_offset_horas": -3.0,
-  
   "telemetria_tempo_ciclo_csv": true,
 
   "protecao": {
@@ -196,6 +195,20 @@
     "cooldown_minutos": 45,
     "max_posicoes_por_ativo": 1
   },
+
+  "filtros": {
+    "cooldown_minutos": 45
+  },
+
+  "protecao_flutuante": {
+    "max_ordens_loss_aberto": 3,
+    "modo": "soft"
+  },
+
+  "max_ordens_loss_flutuante": 3,
+
+  "mt5_retry_max": 2,
+  "mt5_retry_sleep_ms": 120,
 
   "vies": {
     "vote_monitor_janela": 500,
@@ -213,6 +226,9 @@
     "class_weight_updown_boost": 1.2
   },
 
+  "promover_melhor_modelo": true,
+  "permitir_promocao_lstm": false,
+
   "healthcheck": {
     "symbols_check": ["EURUSD", "GBPUSD"],
     "max_tick_silencio_min": 5,
@@ -221,8 +237,9 @@
   },
 
   "exposicao": {
-  "incremento_habilitar": false,
-  "incremento_conf_min": 0.80,
-  "incremento_pnl_dia_min": 0.0
+    "incremento_habilitar": false,
+    "incremento_conf_min": 0.80,
+    "incremento_pnl_dia_min": 0.0
   }
+
 }

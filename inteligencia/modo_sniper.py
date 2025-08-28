@@ -73,3 +73,34 @@ def detectar_sniper(candles, ativo, contexto=None, regime=None):
     except Exception as e:
         log_event(f"[SNIPER] Erro em detectar_sniper({ativo}): {e}", level="error")
         return False
+
+# ========= ADITIVO COMPATÍVEL =========
+def avaliar_modo_sniper(contexto: dict | None, cfg: dict | None = None):
+    """
+    Wrapper neutro (compat): decide de forma leve sem depender de candles.
+    Retorna (permitir, detalhes). Respeita cfg['usar_modo_sniper'].
+    """
+    try:
+        cfg_all = (cfg or carregar_config() or {})
+        if not bool(cfg_all.get("usar_modo_sniper", False)):
+            return False, {"motivo": "cfg_desabilitado"}
+
+        rsi = float((contexto or {}).get("rsi", 50))
+        sqz = bool((contexto or {}).get("squeeze", False))
+        vol = str((contexto or {}).get("volatilidade", "media")).lower()
+
+        low  = float(cfg_all.get("sniper_rsi_low", 30))
+        high = float(cfg_all.get("sniper_rsi_high", 70))
+        require_no_squeeze = bool(cfg_all.get("sniper_requires_no_squeeze", True))
+        min_vol = str(cfg_all.get("sniper_min_volatility", "media")).lower()
+
+        ok_rsi = (rsi <= low) or (rsi >= high)
+        ok_squeeze = (not require_no_squeeze) or (not sqz)
+        ok_vol = _vol_satisfaz(min_vol, vol)
+
+        cond = bool(ok_rsi and ok_squeeze and ok_vol)
+        return cond, {"rsi": rsi, "squeeze": sqz, "volatilidade": vol,
+                      "low": low, "high": high, "min_vol": min_vol,
+                      "motivo": "ok" if cond else "reprovado"}
+    except Exception as e:
+        return False, {"motivo": f"erro_sniper_wrapper:{e}"}

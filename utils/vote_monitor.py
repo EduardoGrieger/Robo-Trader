@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from collections import deque, defaultdict
@@ -140,9 +139,17 @@ class VoteMonitor:
 _singleton: Optional[VoteMonitor] = None
 
 def get_vote_monitor(config: Optional[Dict] = None) -> VoteMonitor:
+    """Singleton com auto-carregamento de config.json quando não for passado."""
     global _singleton
     if _singleton is None:
-        params = BiasParams.from_config(config or {})
+        cfg = config
+        if cfg is None:
+            try:
+                from utils.utils import carregar_config
+                cfg = carregar_config()
+            except Exception:
+                cfg = {}
+        params = BiasParams.from_config(cfg or {})
         _singleton = VoteMonitor(params)
     return _singleton
 
@@ -155,6 +162,13 @@ def obter_multiplicador_lote_por_vies(ativo: str, config: Optional[Dict] = None)
     vm = get_vote_monitor(config)
     return vm.lot_multiplier(ativo)
 
-def resumo_viés(config: Optional[Dict] = None) -> Dict[str, Dict]:
+# Aliases com/sem acento para compatibilidade
+def resumo_vies(config: Optional[Dict] = None) -> Dict[str, Dict]:
     vm = get_vote_monitor(config)
     return vm.summary_all()
+
+def resumo_viés(config: Optional[Dict] = None) -> Dict[str, Dict]:
+    return resumo_vies(config)
+
+def mark_warn(ativo: str) -> None:
+    get_vote_monitor(None).mark_warn_sent(ativo)

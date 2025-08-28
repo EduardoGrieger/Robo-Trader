@@ -555,5 +555,9 @@ datahora,ativo,sinal_robo,preco_entrada,padrao,confianca,motivo,sinal_ideal_n1,r
 2025-08-25 03:15:00,GBPUSD,1,1.35002,interpretacao,0.7508793628876672,votos=RandomForest:0|XGBoost:1|LSTM:1,0,errou,0.3,False
 2025-08-26 03:00:00,EURUSD,-1,1.16308,,0.6000183436754886,votos=RandomForest:-1|XGBoost:0|LSTM:0,0,errou,-3.0,False
 2025-08-26 03:05:00,GBPUSD,-1,1.34654,,0.5785142593716087,votos=RandomForest:-1|XGBoost:0|LSTM:0,0,errou,-12.7,False
-2025-08-26 03:10:00,EURUSD,-1,1.16495,,0.5421913008808051,votos=RandomForest:-1|XGBoost:0|LSTM:0,,,,True
-2025-08-26 03:10:00,GBPUSD,1,1.34781,,0.6030668334293234,votos=RandomForest:-1|XGBoost:1|LSTM:0,,,,True
+2025-08-26 03:10:00,EURUSD,-1,1.16495,,0.5421913008808051,votos=RandomForest:-1|XGBoost:0|LSTM:0,0,errou,5.6,False
+2025-08-26 03:10:00,GBPUSD,1,1.34781,,0.6030668334293234,votos=RandomForest:-1|XGBoost:1|LSTM:0,0,errou,-2.0,False
+2025-08-27 03:00:00,EURUSD,1,1.16398,,0.698297795385537,votos=RandomForest:-1|XGBoost:1|LSTM:1,,,,True
+2025-08-27 03:00:00,GBPUSD,1,1.3477,,0.8192272198033049,votos=RandomForest:0|XGBoost:1|LSTM:1,0,errou,0.4,False
+2025-08-27 03:00:00,EURUSD,1,1.16398,,0.698297795385537,votos=RandomForest:-1|XGBoost:1|LSTM:1,,,,True
+2025-08-27 03:05:00,GBPUSD,1,1.34774,,0.8573553585825238,votos=RandomForest:0|XGBoost:1|LSTM:1,,,,True

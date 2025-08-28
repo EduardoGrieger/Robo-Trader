@@ -3,6 +3,7 @@ import MetaTrader5 as mt5
 from utils.utils import carregar_config
 from utils.debug_logger import log_event
 from datetime import datetime
+import time
 import numpy as np
 
 # =========================
@@ -118,6 +119,10 @@ def _retcode_info(ret):
     cat, mot = tabela.get(r, ("desconhecido", "Código não mapeado. Consulte os logs do terminal."))
     return {"codigo": r, "categoria": cat, "motivo": mot}
 
+def _retcode_transiente(cat: str) -> bool:
+    """Erros que valem a pena tentar novamente rapidamente."""
+    return cat in {"preco_invalido", "preco_mudou", "preco_off", "frozen/requote", "repetir"}
+
 def _symbol_info_str(si) -> str:
     try:
         return (f"digits={getattr(si,'digits',None)} point={getattr(si,'point',None)} "
@@ -211,6 +216,8 @@ def enviar_ordem(tipo, ativo, timestamp, volume=None, sl_pips=None, tp_pips=None
     simulado = cfg.get("usar_modo_simulado", True)
     deviation = int(cfg.get("mt5_deviation", 10))
     magic = int(cfg.get("mt5_magic", 123456))
+    retry_max = int(cfg.get("mt5_retry_max", 2))
+    retry_sleep_ms = int(cfg.get("mt5_retry_sleep_ms", 120))
 
     # debug do contexto recebido
     try:
@@ -309,7 +316,7 @@ def enviar_ordem(tipo, ativo, timestamp, volume=None, sl_pips=None, tp_pips=None
             )
         volume = volume_aj
 
-        # Preço
+        # Preço inicial
         tick = mt5.symbol_info_tick(ativo)
         if not tick:
             saida = {
@@ -347,44 +354,80 @@ def enviar_ordem(tipo, ativo, timestamp, volume=None, sl_pips=None, tp_pips=None
             "type_filling": type_filling,
         }
 
-        result = mt5.order_send(ordem)
-        ticket = getattr(result, "order", 0) or getattr(result, "ticket", 0)
-        retcode = getattr(result, "retcode", "erro")
-        comment = getattr(result, "comment", "")
+        # ========= Envio com retry leve para erros transitórios =========
+        tentativas = 0
+        while True:
+            result = mt5.order_send(ordem)
+            ticket = getattr(result, "order", 0) or getattr(result, "ticket", 0)
+            retcode = getattr(result, "retcode", "erro")
+            comment = getattr(result, "comment", "")
+            info = _retcode_info(retcode)
 
-        # Diagnóstico detalhado
-        diag = {}
-        try:
-            diag = {
-                "last_error": mt5.last_error(),
-                "symbol_info": {
-                    "digits": getattr(si, "digits", None),
-                    "point": getattr(si, "point", None),
-                    "stops_level": getattr(si, "trade_stops_level", None),
-                    "freeze_level": getattr(si, "trade_freeze_level", None),
-                    "fill_mode": getattr(si, "trade_fill_mode", None),
-                    "volume_min": getattr(si, "volume_min", None),
-                    "volume_step": getattr(si, "volume_step", None),
-                    "volume_max": getattr(si, "volume_max", None),
-                },
-                "volume_enviado": volume,
-            }
-        except Exception:
-            pass
+            # Diagnóstico detalhado a cada tentativa
+            diag = {}
+            try:
+                diag = {
+                    "last_error": mt5.last_error(),
+                    "symbol_info": {
+                        "digits": getattr(si, "digits", None),
+                        "point": getattr(si, "point", None),
+                        "stops_level": getattr(si, "trade_stops_level", None),
+                        "freeze_level": getattr(si, "trade_freeze_level", None),
+                        "fill_mode": getattr(si, "trade_fill_mode", None),
+                        "volume_min": getattr(si, "volume_min", None),
+                        "volume_step": getattr(si, "volume_step", None),
+                        "volume_max": getattr(si, "volume_max", None),
+                    },
+                    "volume_enviado": volume,
+                    "tentativa": tentativas + 1,
+                }
+            except Exception:
+                pass
 
-        info = _retcode_info(retcode)
-        saida = {
-            "retcode": retcode,
-            "order": ticket,
-            "preco": float(price),
-            "comment": comment,
-            "motivo": info["motivo"],
-            "diagnostico": diag,
-        }
-        sanity_check_ordem(saida)
-        level = "info" if _retcode_sucesso(retcode) and (ticket and int(ticket) > 0) else "warning"
-        log_event(f"[ORDEM ENVIADA] {saida} | {_symbol_info_str(si)}", level=level)
-        return saida
+            # Sucesso ou não-transiente → sai do loop
+            if _retcode_sucesso(retcode) or not _retcode_transiente(info["categoria"]) or tentativas >= retry_max:
+                # Se sucesso mas last_error != 0, loga como ruído (observado em terminais MT5)
+                try:
+                    le = mt5.last_error()
+                    if _retcode_sucesso(retcode) and isinstance(le, tuple) and le and le[0] not in (0, None):
+                        log_event(f"[MT5 NOISE] Retcode sucesso {retcode} mas last_error={le} — ignorando como ruído do terminal.", level="warning")
+                except Exception:
+                    pass
+
+                saida = {
+                    "retcode": retcode,
+                    "order": ticket,
+                    "preco": float(ordem["price"]),
+                    "comment": comment,
+                    "motivo": info["motivo"],
+                    "diagnostico": diag,
+                }
+                sanity_check_ordem(saida)
+                level = "info" if _retcode_sucesso(retcode) and (ticket and int(ticket) > 0) else "warning"
+                log_event(f"[ORDEM ENVIADA] {saida} | {_symbol_info_str(si)}", level=level)
+                return saida
+
+            # Retry transitório: espera um pouco, atualiza preço e SL/TP, reenvia
+            time.sleep(max(0, retry_sleep_ms) / 1000.0)
+            tick = mt5.symbol_info_tick(ativo)
+            if not tick:
+                saida = {
+                    "retcode": "erro",
+                    "order": None,
+                    "preco": None,
+                    "comment": "tick_indisponivel_retry",
+                    "motivo": "tick indisponível (retry)",
+                    "diagnostico": diag,
+                }
+                sanity_check_ordem(saida)
+                log_event(f"[ERRO ENVIO ORDEM RETRY] Tick indisponível para {ativo}", level="error")
+                return saida
+            price = tick.ask if lado == "buy" else tick.bid
+            sl, tp = _calc_sl_tp_prices(lado, price, sl_pips, tp_pips, pip_factor, si)
+            ordem["price"] = float(price)
+            ordem["sl"] = float(sl)
+            ordem["tp"] = float(tp)
+            tentativas += 1
 
     except Exception as e:
         log_event(f"[ERRO ENVIO ORDEM] {str(e)}", level="error")

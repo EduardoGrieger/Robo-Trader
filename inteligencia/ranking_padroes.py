@@ -10,12 +10,12 @@ O que há aqui:
   -> Tolerante a valores faltantes; nunca levanta exceção; sempre retorna uma tupla.
 
 - RANKING (placar): atualizar_ranking, exibir_top_padroes, obter_score_padrao, obter_score_e_n
-  -> Mantido 100% compatível com sua versão original.
+  -> Compatível com sua versão: 
+     * obter_score_padrao(padrao, ativo=None) -> float  (mantido)
+     * obter_score_padrao(df: DataFrame) -> (padrao, score)  (NOVO)
 
 Motivação:
-- O loop principal estava logando: "[PADRAO] não foi possível calcular: cannot unpack non-iterable float object".
-  Isso acontece quando quem chama faz `padrao, score = ...` mas a função retornava apenas um `float`.
-  Com este arquivo, garantimos contrato estável (sempre (str, float)), evitando None/erros de unpack.
+- Evitar o erro de "unpack" quando quem chama faz `padrao, score = obter_score_padrao(df)`.
 """
 
 from __future__ import annotations
@@ -27,13 +27,17 @@ from typing import Any, Mapping, Tuple, List
 import pandas as pd
 
 try:
+    import numpy as np  # usado apenas no helper de DF
+except Exception:
+    np = None
+
+try:
     from utils.debug_logger import log_event
 except Exception:
     # Fallback simples se o util não estiver disponível
     import logging
     _fallback_logger = logging.getLogger("ranking_padroes")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
     def log_event(msg: str, level: str = "info"):
         lvl = getattr(_fallback_logger, level if hasattr(_fallback_logger, level) else "info")
         lvl(msg)
@@ -52,7 +56,6 @@ def _safe_get(m: Mapping[str, Any], key: str, default: Any = None) -> Any:
     except Exception:
         return default
 
-
 def _as_float(v: Any, default: float = math.nan) -> float:
     try:
         if v is None:
@@ -69,18 +72,15 @@ def _as_float(v: Any, default: float = math.nan) -> float:
         except Exception:
             return default
 
-
 def _as_bool(v: Any) -> bool:
     if isinstance(v, bool):
         return v
     return str(v).strip().lower() in {"1", "true", "t", "y", "yes", "sim"}
 
-
 def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     if x is None or math.isnan(x):
         return lo
     return max(lo, min(hi, float(x)))
-
 
 def rankear(row: Mapping[str, Any]) -> Tuple[str, float]:
     """
@@ -205,11 +205,58 @@ def rankear(row: Mapping[str, Any]) -> Tuple[str, float]:
         log_event(f"[PADRAO] Erro inesperado em rankear(): {e}. Fallback ('sem_padrao', 0.0).", level="error")
         return "sem_padrao", 0.0
 
-
-# Aliases para compatibilidade (o main_loop pode chamar qualquer um deles)
+# Aliases para compatibilidade
 rankear_padroes = rankear
 detectar_padrao = rankear
 calcular_padrao = rankear
+
+# =====================================================================
+# ----------------- Helper NOVO para DataFrame inteiro ----------------
+# =====================================================================
+
+def _inferir_padrao_df(df: "pd.DataFrame") -> Tuple[str, float]:
+    """
+    Heurística leve e estável usando os últimos closes:
+    - 'tend_alta': inclinação > limiar
+    - 'tend_baixa': inclinação < -limiar
+    - 'range': caso contrário
+    Score ∈ [0,1] pela força da tendência; em 'range' penaliza volatilidade.
+    """
+    try:
+        if df is None or df.empty or "close" not in df.columns:
+            return "sem_padrao", 0.0
+        if np is None:
+            return "sem_padrao", 0.0
+
+        s = df["close"].tail(100).astype(float).dropna()
+        if s.shape[0] < 5:
+            return "sem_padrao", 0.0
+
+        y = s.values
+        x = np.arange(len(y), dtype=float)
+        # regressão linear simples
+        slope = float(np.polyfit(x, y, 1)[0])
+        std = float(np.std(y))
+        if std <= 0:
+            return "sem_padrao", 0.0
+
+        strength = abs(slope) / (std + 1e-12)
+        LIM = 0.20
+
+        if slope > 0 and strength >= LIM:
+            padrao = "tend_alta"
+            score = _clamp(0.5 + min(0.5, strength))
+        elif slope < 0 and strength >= LIM:
+            padrao = "tend_baixa"
+            score = _clamp(0.5 + min(0.5, strength))
+        else:
+            padrao = "range"
+            rng = float(np.max(y) - np.min(y)) / (float(np.mean(y)) + 1e-12)
+            score = _clamp(0.7 - min(0.3, rng * 3.0))
+
+        return padrao, float(score)
+    except Exception:
+        return "sem_padrao", 0.0
 
 # =====================================================================
 # --------------------------- RANKING (CSV) ---------------------------
@@ -217,8 +264,6 @@ calcular_padrao = rankear
 
 RANKING_PATH = "dados/ranking_padroes.csv"
 COLS = ["ativo", "padrao", "acertos", "erros", "neutros", "total"]
-
-# =============== utilitários internos ===============
 
 def _ensure_dir(path):
     d = os.path.dirname(path)
@@ -232,10 +277,8 @@ def _ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
     for c in COLS:
         if c not in df.columns:
             df[c] = 0 if c in ("acertos", "erros", "neutros", "total") else ""
-    # Tipos numéricos
     for c in ("acertos", "erros", "neutros", "total"):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-    # Strings
     df["ativo"] = df["ativo"].astype(str)
     df["padrao"] = df["padrao"].astype(str)
     return df[COLS]
@@ -261,8 +304,6 @@ def _safe_write_df(df: pd.DataFrame, path: str):
     except Exception as e:
         log_event(f"[RANKING] Falha ao gravar CSV: {e}", level="error")
 
-# =============== API pública ===============
-
 def atualizar_ranking(ativo, row: dict):
     """
     Atualiza o ranking de padrões vencedores/perdedores.
@@ -271,13 +312,11 @@ def atualizar_ranking(ativo, row: dict):
     - acerto/erro/neutro com base em 'lucro' (>0, <0, ==0).
     """
     try:
-        # Extrai campos usuais (com fallback)
         padrao_in = row.get("padrao")
         sinal = str(row.get("sinal", "sem_sinal"))
         regime = str(row.get("regime", "indefinido"))
         contexto = str(row.get("contexto", "sem_contexto"))
 
-        # Use o padrao explícito se existir; senão, reconstrói
         padrao = str(padrao_in) if padrao_in not in (None, "", "None") else f"{sinal}_{regime}_{contexto}"
 
         lucro_raw = row.get("lucro", 0)
@@ -325,9 +364,7 @@ def atualizar_ranking(ativo, row: dict):
         log_event(f"[RANKING] Erro ao atualizar ranking: {e}", level="error")
 
 def exibir_top_padroes(top=10):
-    """
-    Apenas logging: top vencedores e perdedores por taxa.
-    """
+    """Apenas logging: top vencedores e perdedores por taxa."""
     try:
         df = _read_df()
         if df.empty:
@@ -342,17 +379,25 @@ def exibir_top_padroes(top=10):
     except Exception as e:
         log_event(f"[RANKING] Erro ao exibir ranking: {e}", level="error")
 
-def obter_score_padrao(padrao, ativo=None) -> float:
+def obter_score_padrao(padrao_ou_df, ativo=None):
     """
-    Retorna score adaptativo do padrão (-1 a +1).
-    Score = (acertos - erros) / total
-    (mantido por compatibilidade)
+    Sobrecarga compatível:
+      - obter_score_padrao(padrao: str, ativo: str|None) -> float      (MODO ANTIGO)
+      - obter_score_padrao(df: pandas.DataFrame) -> (padrao: str, score: float)  (NOVO)
     """
+    # NOVO: modo DataFrame → (padrao, score)
     try:
-        score, _n = obter_score_e_n(padrao, ativo=ativo)
+        if isinstance(padrao_ou_df, pd.DataFrame):
+            return _inferir_padrao_df(padrao_ou_df)
+    except Exception:
+        pass
+
+    # MODO ANTIGO: (padrao, ativo) → float com base no CSV
+    try:
+        score, _n = obter_score_e_n(str(padrao_ou_df), ativo=ativo)
         return score
     except Exception as e:
-        log_event(f"[RANKING] Erro em obter_score_padrao('{padrao}'): {e}", level="error")
+        log_event(f"[RANKING] Erro em obter_score_padrao('{padrao_ou_df}'): {e}", level="error")
         return 0.0
 
 def obter_score_e_n(padrao, ativo=None):

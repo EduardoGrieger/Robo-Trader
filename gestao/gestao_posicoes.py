@@ -124,9 +124,7 @@ def _position_type_buy(mt5) -> int:
 
 # ========= API pública =========
 def listar_posicoes_ativas(symbol: Optional[str] = None):
-    """
-    Retorna lista de posições ativas (objetos MT5). Use obter_ordens_abertas_mt5 para dicionários.
-    """
+    """Retorna lista de posições ativas (objetos MT5). Use obter_ordens_abertas_mt5 para dicionários."""
     mt5 = _get_mt5()
     if not _mt5_ok(mt5):
         return []
@@ -136,9 +134,7 @@ def listar_posicoes_ativas(symbol: Optional[str] = None):
         return []
 
 def obter_ordens_abertas_mt5(ativo: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Retorna lista de posições abertas em formato de dicionário.
-    """
+    """Retorna lista de posições abertas em formato de dicionário."""
     mt5 = _get_mt5()
     if not _mt5_ok(mt5):
         return []
@@ -184,9 +180,7 @@ def valor_investido(symbol: Optional[str] = None, usar_preco_ultimo: bool = True
 calcular_valor_investido = valor_investido
 
 def posicao_liquida_por_ativo() -> Dict[str, float]:
-    """
-    Volume líquido (em lotes) por ativo: >0 comprado, <0 vendido.
-    """
+    """Volume líquido (em lotes) por ativo: >0 comprado, <0 vendido."""
     mt5 = _get_mt5()
     if not _mt5_ok(mt5):
         return {}
@@ -210,10 +204,8 @@ def posicao_liquida_por_ativo() -> Dict[str, float]:
     return acc
 
 def resumo_posicoes() -> Dict[str, Any]:
-    """
-    Resumo simples: contagem de posições, valor investido (nocional),
-    posição líquida por ativo e risco aberto aproximado.
-    """
+    """Resumo simples: contagem de posições, valor investido (nocional),
+    posição líquida por ativo e risco aberto aproximado."""
     return {
         "qtd_posicoes": len(listar_posicoes_ativas()),
         "valor_investido": valor_investido(),
@@ -222,15 +214,10 @@ def resumo_posicoes() -> Dict[str, Any]:
     }
 
 def lucro_aberto(ativo: str) -> float:
-    """
-    PnL aberto aproximado do ativo (moeda da conta).
-    Compra (type=0) usa BID; Venda (type=1) usa ASK.
-    Aproximação nocional: contract_size * delta_preco * lotes.
-    """
+    """PnL aberto aproximado do ativo (moeda da conta)."""
     mt5 = _get_mt5()
     if not _mt5_ok(mt5):
         return 0.0
-
     try:
         posicoes = mt5.positions_get(symbol=ativo) or []
         tick = mt5.symbol_info_tick(ativo)
@@ -261,17 +248,12 @@ def lucro_aberto(ativo: str) -> float:
     return float(pnl)
 
 def lucro_aberto_total(symbol: Optional[str] = None) -> float:
-    """
-    PnL aberto total. Se `symbol` for fornecido, restringe a ele; caso contrário,
-    soma aberto de todos os símbolos com posições.
-    """
+    """PnL aberto total (todos os símbolos ou um específico)."""
     mt5 = _get_mt5()
     if not _mt5_ok(mt5):
         return 0.0
-
     if symbol:
         return lucro_aberto(symbol)
-
     total = 0.0
     for sym in _simbolos_posicoes(mt5):
         try:
@@ -285,11 +267,7 @@ def lucro_fechado(start: Optional[dt.datetime] = None,
                   symbol: Optional[str] = None,
                   incluir_comissoes: bool = True,
                   incluir_swaps: bool = True) -> float:
-    """
-    Lucro líquido FECHADO no histórico (somatório de deals) no intervalo [start, end].
-    Usa mt5.history_deals_get(). Soma: profit (+ commission, + swap) conforme flags.
-    Default: hoje 00:00 até agora.
-    """
+    """Lucro líquido FECHADO no histórico (somatório de deals) no intervalo [start, end]."""
     mt5 = _get_mt5()
     if not _mt5_ok(mt5):
         return 0.0
@@ -329,12 +307,7 @@ def lucro_total(start: Optional[dt.datetime] = None,
                 incluir_aberto: bool = True,
                 incluir_comissoes: bool = True,
                 incluir_swaps: bool = True) -> float:
-    """
-    Retorna o lucro total (fechado +, opcionalmente, aberto) no intervalo solicitado.
-    - Se `symbol` for informado, restringe a ele.
-    - Fechado: via `lucro_fechado(...)`.
-    - Aberto: soma PnL aberto atual das posições (em tempo real) se `incluir_aberto=True`.
-    """
+    """Lucro total (fechado + opcionalmente aberto) no intervalo solicitado."""
     fechado = lucro_fechado(start=start, end=end, symbol=symbol,
                             incluir_comissoes=incluir_comissoes,
                             incluir_swaps=incluir_swaps)
@@ -344,9 +317,7 @@ def lucro_total(start: Optional[dt.datetime] = None,
     return float(fechado + aberto)
 
 def exposicao_ftmo(ativo: str) -> float:
-    """
-    Exposição aproximada (notional) do ativo.
-    """
+    """Exposição aproximada (notional) do ativo."""
     mt5 = _get_mt5()
     if not _mt5_ok(mt5):
         return 0.0
@@ -371,9 +342,7 @@ def exposicao_ftmo(ativo: str) -> float:
     return float(total)
 
 def saldo_bruto() -> float:
-    """
-    Retorna o saldo (balance) atual da conta. 0.0 se indisponível.
-    """
+    """Saldo (balance) atual da conta. 0.0 se indisponível."""
     mt5 = _get_mt5()
     if not _mt5_ok(mt5):
         return 0.0
@@ -384,9 +353,7 @@ def saldo_bruto() -> float:
         return 0.0
 
 def risco_aberto_ftmo(ativo: Optional[str] = None) -> float:
-    """
-    Soma de risco aproximado com base no SL: distância até preço de abertura * notional.
-    """
+    """Soma de risco aproximado com base no SL: distância até preço de abertura * notional."""
     mt5 = _get_mt5()
     if not _mt5_ok(mt5):
         return 0.0
@@ -436,9 +403,7 @@ def lucro_dia(symbol: Optional[str] = None,
               incluir_aberto: bool = True,
               incluir_comissoes: bool = True,
               incluir_swaps: bool = True) -> float:
-    """
-    Convenience: lucro TOTAL de hoje (00:00 -> agora).
-    """
+    """Convenience: lucro TOTAL de hoje (00:00 -> agora)."""
     start = _inicio_do_dia()
     return lucro_total(start=start, end=None, symbol=symbol,
                        incluir_aberto=incluir_aberto,
@@ -487,12 +452,34 @@ def percentual_lucro_dia(symbol: Optional[str] = None,
                          incluir_swaps: bool = True,
                          base: str = "saldo_atual",
                          base_val: Optional[float] = None) -> float:
-    """
-    Percentual de lucro de hoje (00:00 -> agora).
-    """
+    """Percentual de lucro de hoje (00:00 -> agora)."""
     start = _inicio_do_dia()
     return percentual_lucro(start=start, end=None, symbol=symbol,
                             incluir_aberto=incluir_aberto,
                             incluir_comissoes=incluir_comissoes,
                             incluir_swaps=incluir_swaps,
                             base=base, base_val=base_val)
+
+# ========= ADITIVO COMPATÍVEL =========
+def pode_abrir_nova_posicao(ativo: str, cfg: Dict[str, Any] | None = None) -> bool:
+    """
+    Respeita cfg['protecao']['max_posicoes_por_ativo'] (default=1).
+    Não inicializa/desinicializa MT5 — usa sessão já aberta pelo processo principal.
+    Se MT5 não estiver ok, retorna True (não trava o robô).
+    """
+    try:
+        max_por_ativo = int(((cfg or {}).get("protecao") or {}).get("max_posicoes_por_ativo", 1))
+    except Exception:
+        max_por_ativo = 1
+    if max_por_ativo <= 0:  # 0 ou negativo => sem limite
+        return True
+
+    mt5 = _get_mt5()
+    if not _mt5_ok(mt5):
+        return True
+    try:
+        pos = mt5.positions_get(symbol=ativo) or []
+        qtd = len(pos)
+        return qtd < max_por_ativo
+    except Exception:
+        return True

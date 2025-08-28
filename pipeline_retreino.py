@@ -13,10 +13,14 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 
+# ================== Contexto/paths ==================
 PROJETO_ROOT = os.path.dirname(os.path.abspath(__file__))
 os.chdir(PROJETO_ROOT)  # Garante execução sempre na raiz
-
 sys.path.insert(0, PROJETO_ROOT)
+
+# Seeds/ambiente estáveis para os subprocessos
+os.environ.setdefault("PYTHONHASHSEED", "42")
+os.environ.setdefault("PIPELINE_SEED", "42")
 
 # === IMPORTS ORIGINAIS ===
 from comunicacao.telegram_bot import enviar_telegram
@@ -35,6 +39,15 @@ def enviar_alerta_telegram(mensagem: str):
     except Exception as e:
         log_event(f"Falha ao enviar mensagem Telegram: {e}", level="error")
 
+# ================== Execução controlada ==================
+def _env_para_subprocesso():
+    """Monta um ambiente consistente para os subprocessos."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(PROJETO_ROOT)
+    env.setdefault("PYTHONHASHSEED", "42")
+    env.setdefault("PIPELINE_SEED", "42")
+    return env
+
 def rodar_script(path, descricao=None):
     script_path = os.path.normpath(os.path.join(PROJETO_ROOT, path))
     log_event(f"Rodando: {script_path} {'- ' + descricao if descricao else ''}", level="info")
@@ -45,7 +58,9 @@ def rodar_script(path, descricao=None):
             text=True,
             check=True,
             encoding="utf-8",
-            errors="replace"
+            errors="replace",
+            cwd=PROJETO_ROOT,
+            env=_env_para_subprocesso(),
         )
         log_event(f"OK - {path}\n{resultado.stdout}", level="info")
         enviar_alerta_telegram(f"✅ Sucesso: {descricao or path}")
@@ -55,9 +70,13 @@ def rodar_script(path, descricao=None):
         log_event(erro_msg, level="error")
         enviar_alerta_telegram(erro_msg)
         return False
+    except FileNotFoundError as e:
+        erro_msg = f"❌ Script não encontrado: {path} ({e})"
+        log_event(erro_msg, level="error")
+        enviar_alerta_telegram(erro_msg)
+        return False
 
 # ========= PROMOÇÃO/BACKUP controlados (só quando TROCAR) =========
-
 def _ts():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -180,7 +199,6 @@ def promover_modelos_se_aprovados():
             log_event(f"[RETREINO] Não foi possível remover flag de aprovação: {e}", level="warning")
 
 # ========= (Fase 9) Gate Walk-Forward: helpers =========
-
 def _carregar_walkforward_veredito() -> dict:
     """
     Procura veredito do WF em:
@@ -230,12 +248,12 @@ def _registrar_auditoria_promocao(payload: dict) -> str:
     return destino
 
 # =============================================================================
-
 def main():
     print("===> Iniciando pipeline de retreinamento do Robô IA FTMO...")
     log_event("==== Início do Pipeline de Retreino IA ====", level="info")
     enviar_alerta_telegram("🚀 Iniciando pipeline de retreinamento do Robô IA FTMO")
 
+    # Etapas do pipeline (mantidas, com o mesmo comportamento)
     etapas = [
         ("features/gerar_features.py", "Geração dos features para IA", True),
         ("mt5/coletar_candles_mt5.py", "Coleta/atualização dos candles", True),
@@ -246,8 +264,24 @@ def main():
         ("utils/auditor_features.py", "Auditoria dos features (opcional)", False)
     ]
 
+    # Permite desligar/forçar etapas via config (sem quebrar padrão atual)
+    cfg = {}
+    try:
+        cfg = carregar_config() or {}
+    except Exception:
+        cfg = {}
+
+    etapas_skip = set(map(str, (cfg.get("pipeline_skip", []) or [])))
+    etapas_force = set(map(str, (cfg.get("pipeline_force", []) or [])))
     sucesso_geral = True
+
     for path, descricao, critico in etapas:
+        nome_chave = os.path.splitext(os.path.basename(path))[0]
+        # se estiver em skip e não estiver em force, pula
+        if nome_chave in etapas_skip and nome_chave not in etapas_force:
+            log_event(f"[PIPELINE] Etapa pulada por config: {descricao} ({path})", level="info")
+            continue
+
         if not rodar_script(path, descricao):
             sucesso_geral = False
             if critico:
@@ -264,8 +298,7 @@ def main():
         # ===== (Fase 9) Gate Walk-Forward A/B + relatório =====
         try:
             ROOT = Path(PROJETO_ROOT)
-            env = os.environ.copy()
-            env["PYTHONPATH"] = str(ROOT)  # garante import de utils/ e scripts/
+            env = _env_para_subprocesso()
 
             cfg = carregar_config()
             features_csv = ROOT / "dados" / "features.csv"

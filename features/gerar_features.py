@@ -188,11 +188,60 @@ def calcular_price_action(df):
     log_event("[features] Price Action calculado")
     return df
 
+def _to_utc_cols(df):
+    """
+    Constrói colunas UTC e epoch a partir de 'data_hora' OU 'timestamp' OU 'time'.
+    Garante Series alinhada ao índice (nunca escalar) e respeita
+    config['timezone_servidor_offset_horas'].
+    """
+    import pandas as pd, numpy as np
+    try:
+        cfg = carregar_config()
+    except Exception:
+        cfg = {}
+
+    # 1) Escolhe base de tempo sempre como SERIES (evita escalar que quebra .dt)
+    if "data_hora" in df.columns:
+        base = pd.to_datetime(df["data_hora"], errors="coerce")
+    elif "timestamp" in df.columns:
+        base = pd.to_datetime(df["timestamp"], errors="coerce")
+    elif "time" in df.columns:
+        base = pd.to_datetime(df["time"], errors="coerce")
+    else:
+        # fallback: Series com 'agora' no mesmo índice
+        base = pd.Series(pd.Timestamp.utcnow(), index=df.index, dtype="datetime64[ns]")
+
+    # 2) Aplica offset do servidor para chegar em UTC
+    try:
+        offset_h = float(cfg.get("timezone_servidor_offset_horas", 0.0))
+    except Exception:
+        offset_h = 0.0
+    # Ex.: offset_h=-3 (servidor UTC-3) -> UTC = local - (-3h) = local + 3h
+    base_utc = base - pd.to_timedelta(offset_h, unit="h")
+
+    # 3) Colunas finais (com .dt seguro porque é Series)
+    df["data_hora_utc"]   = base_utc
+    df["timestamp_utc"]   = base_utc.dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Epoch (segundos); NaT -> NaN
+    try:
+        ns   = base_utc.view("int64")              # datetime64[ns] -> int (ns)
+        secs = (ns // 1_000_000_000)
+        secs = secs.where(base_utc.notna(), np.nan)
+    except Exception:
+        secs = pd.Series(np.nan, index=df.index)
+    df["timestamp_epoch"] = secs.astype(float)
+
+    return df
+
 def calcular_contexto_mercado(df):
     df = df.copy()
     if len(df) < 2:
         df["timestamp"] = ""
         df["data_hora"] = pd.to_datetime("now")
+        df["data_hora_utc"] = pd.to_datetime("now", utc=True)
+        df["timestamp_utc"] = pd.to_datetime("now", utc=True).strftime("%Y-%m-%d %H:%M:%S")
+        df["timestamp_epoch"] = np.nan
         df["hour_sin"] = 0
         df["hour_cos"] = 0
         df["vol_ratio"] = 0
@@ -203,9 +252,13 @@ def calcular_contexto_mercado(df):
         df["data_hora"] = pd.to_datetime(df["time"])
     else:
         df["data_hora"] = pd.to_datetime("now")
-    hora = df["data_hora"].dt.hour
+
+    # >>> NOVO: garantir colunas UTC e epoch, e usar UTC para seno/cosseno da hora
+    df = _to_utc_cols(df)
+    hora = df["data_hora_utc"].dt.hour
     df["hour_sin"] = np.sin(2 * np.pi * hora / 24)
     df["hour_cos"] = np.cos(2 * np.pi * hora / 24)
+
     df["vol_ratio"] = (df["high"] - df["low"]) / (df["close"].rolling(20, min_periods=1).std() + 1e-9)
     if "tick_volume" in df.columns:
         z1h = (df["tick_volume"].rolling(12, min_periods=1).sum() - df["tick_volume"].rolling(288, min_periods=1).mean()) / \
@@ -213,7 +266,7 @@ def calcular_contexto_mercado(df):
         df["tick_vol_zscore"] = z1h
     else:
         df["tick_vol_zscore"] = 0
-    log_event("[features] Contexto de mercado calculado")
+    log_event("[features] Contexto de mercado (UTC-aware) calculado")
     return df
 
 def calcular_sinais_derivados(df):
@@ -502,7 +555,9 @@ def pre_processar_final(df):
         "macd", "macd_signal", "macd_hist", "ema_21", "ema_200", "ema_distance",
         "atr_14", "adx_14", "cci", "stoch_k", "stoch_d",
         # meta-features do treino/inferência
-        "volatility_20", "volatility_50", "trend_strength", "range_ratio"
+        "volatility_20", "volatility_50", "trend_strength", "range_ratio",
+        # novo: epoch ajuda na telemetria e é numérico
+        "timestamp_epoch"
     ]
 
     # Remove colunas “mortas”
@@ -528,29 +583,26 @@ def pre_processar_final(df):
 def _assegurar_timestamp(df):
     """
     Garante a existência da coluna 'timestamp' para consumo do main_loop/validador.
-    Respeita 'time' e 'data_hora' se existirem; caso contrário, cria um timestamp básico.
+    Respeita 'time' e 'data_hora' se existirem; adiciona 'timestamp_utc' e 'timestamp_epoch'.
     """
     df = df.copy()
-    if "timestamp" in df.columns and not df["timestamp"].isnull().all():
-        return df
-    if "time" in df.columns:
-        try:
-            df["timestamp"] = pd.to_datetime(df["time"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
-            return df
-        except Exception:
-            pass
-    if "data_hora" in df.columns:
-        try:
-            df["timestamp"] = pd.to_datetime(df["data_hora"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
-            return df
-        except Exception:
-            pass
-    # fallback: usa index ou "now"
-    try:
-        ts_series = pd.to_datetime(df.index, errors="coerce").strftime("%Y-%m-%d %H:%M:%S")
-        df["timestamp"] = ts_series
-    except Exception:
-        df["timestamp"] = pd.to_datetime("now").strftime("%Y-%m-%d %H:%M:%S")
+    if "timestamp" not in df.columns or df["timestamp"].isnull().all():
+        if "time" in df.columns:
+            try:
+                df["timestamp"] = pd.to_datetime(df["time"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                df["timestamp"] = pd.to_datetime("now").strftime("%Y-%m-%d %H:%M:%S")
+        elif "data_hora" in df.columns:
+            try:
+                df["timestamp"] = pd.to_datetime(df["data_hora"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                df["timestamp"] = pd.to_datetime("now").strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            df["timestamp"] = pd.to_datetime("now").strftime("%Y-%m-%d %H:%M:%S")
+
+    # Garante UTC/epoch mesmo se chamado isoladamente
+    if "data_hora_utc" not in df.columns or "timestamp_epoch" not in df.columns or "timestamp_utc" not in df.columns:
+        df = _to_utc_cols(df)
     return df
 
 def auditar_features_ultima_linha(df, ativo=""):
@@ -569,7 +621,9 @@ def auditar_features_ultima_linha(df, ativo=""):
         "macd", "macd_signal", "macd_hist", "ema_21", "ema_200",
         "atr_14", "adx_14", "cci", "stoch_k", "stoch_d",
         # meta-features do treino/inferência
-        "volatility_20", "volatility_50", "trend_strength", "range_ratio"
+        "volatility_20", "volatility_50", "trend_strength", "range_ratio",
+        # novo: epoch numérico para depuração de tempo
+        "timestamp_epoch"
     ]
 
     ausentes = [c for c in essenciais if c not in df.columns]
@@ -656,7 +710,7 @@ def calcular_features(candles, config, ativo=""):
 
         df["sinal"] = df["sinal"].apply(normalizar_sinal)
         df = pre_processar_final(df)
-        df = _assegurar_timestamp(df)      # garante 'timestamp'
+        df = _assegurar_timestamp(df)      # garante 'timestamp', 'timestamp_utc' e 'timestamp_epoch'
         auditar_features_ultima_linha(df, ativo=ativo)
 
         distrib = df["sinal"].value_counts(normalize=True).to_dict()
@@ -750,6 +804,7 @@ def main():
     if all_features:
         df_all = pd.concat(all_features, ignore_index=True)
         os.makedirs("dados", exist_ok=True)
+        # Mantemos apenas numéricos/bool (como antes), mas agora com timestamp_epoch incluso
         df_all["sinal"] = df_all["sinal"].apply(normalizar_sinal)
         numericas = df_all.select_dtypes(include=[np.number, 'bool']).columns
         df_all[numericas].to_csv("dados/features.csv", index=False)

@@ -13,7 +13,8 @@ from mt5.coletar_candles_mt5 import coletar_candles
 from features.gerar_features import calcular_features
 from inteligencia.estrategia_ia import gerar_sinal
 from inteligencia.validar_tp_sl import validar_tp_sl_historico  # <-- (ajuste de import se necessário)
-from utils.debug_logger import log_event, log_delay_execucao, log_decisao
+from utils.debug_logger import log_event, log_decisao  # <- AJUSTE: log_delay_execucao sai daqui
+from utils.monitor_delay_execucao import log_delay_execucao   # <- NOVO: import correto
 
 def _pode_abrir_nova_posicao(ativo: str, max_por_ativo: int) -> bool:
     try:
@@ -54,7 +55,8 @@ from utils.protecao_loss import (
     atingiu_loss_diario, bloquear_entradas_loss, esta_bloqueado_loss,
 )
 from utils.protecao_loss_flutuante import (
-    checar_loss_flutuante, bloquear_loss_flutuante, esta_bloqueado_loss_flutuante
+    checar_loss_flutuante, bloquear_loss_flutuante, esta_bloqueado_loss_flutuante,
+    modo_acao_loss_flutuante  # <- NOVO
 )
 from utils.horario_operacional import dentro_horario_operacao
 from utils.meta_diaria import atingiu_meta_periodo
@@ -339,7 +341,9 @@ def main():
     caminho_banco = "dados/robodados.duckdb"
     saldo_inicial = config.get("capital_conta", 10000)
     limite_loss_dia = -abs(saldo_inicial * (config.get("limite_loss_dia_percentual", 2.5) / 100))
-    max_ordens_loss_aberto = config.get("max_ordens_loss_flutuante", 3)
+    # <- AJUSTE: lê novo e legado
+    max_ordens_loss_aberto = (config.get("protecao_flutuante", {}) or {}).get("max_ordens_loss_aberto",
+                               config.get("max_ordens_loss_flutuante", 3))
     horarios_operacao = config.get("horarios_operacao", [{"inicio": "00:00", "fim": "23:59"}])
     meta_gain = config.get("meta_gain_dia", 2)
     meta_loss = config.get("meta_loss_dia", -2)
@@ -354,6 +358,11 @@ def main():
     MIN_EVID_PADRAO = int(config.get("min_evid_padroes", 20))  # só aplica limiar quando N >= este valor
     TP_SL_BLOCK_CONF = float(config.get("tp_sl_block_confidence", 0.6))  # confiança mínima para bloquear por TP/SL preview
     TP_SL_PENALTY = float(config.get("tp_sl_penalty", 0.10))  # penalidade "advisory" no score_total
+
+    # === Cooldown inicial (minutos) ===
+    filtros_cfg = (config.get("filtros", {}) if isinstance(config, dict) else {}) or {}
+    cooldown_minutos = int(filtros_cfg.get("cooldown_minutos", config.get("cooldown_minutos", 0)))
+    inicio_execucao = datetime.now()
 
     print(Fore.YELLOW + "🚀 Robô FTMO INSTITUCIONAL iniciado." + Style.RESET_ALL)
     log_event("Robô iniciado", level="info")
@@ -400,9 +409,30 @@ def main():
 
             garantir_conexao_mt5(intervalo_reconexao_mt5)
 
+            # Estado de cooldown deste ciclo
+            em_cooldown = False
+            if cooldown_minutos > 0:
+                try:
+                    em_cooldown = (datetime.now() - inicio_execucao) < timedelta(minutes=cooldown_minutos)
+                    if em_cooldown:
+                        try:
+                            if deve_notificar_cooldown():
+                                enviar_telegram(f"⏳ Em cooldown inicial de {cooldown_minutos} min. Sem novas entradas.")
+                                registrar_notificacao_cooldown()
+                        except Exception:
+                            pass
+                except Exception:
+                    em_cooldown = False
+
             # BLOQUEIOS INSTITUCIONAIS
             bloqueios_status['feriado'] = eh_feriado()
             bloqueios_status['loss_diario'] = esta_bloqueado_loss()
+            # Modo de ação (soft/hard) para flutuante
+            modo_flut = "hard"
+            try:
+                modo_flut = modo_acao_loss_flutuante()
+            except Exception:
+                modo_flut = "hard"
             bloqueios_status['loss_flutuante'] = esta_bloqueado_loss_flutuante()
             atingiu_meta_flag, tipo_meta, _ = atingiu_meta_periodo()
             bloqueios_status['meta_diaria'] = atingiu_meta_flag
@@ -418,7 +448,6 @@ def main():
                             break
                     except Exception as e:
                         log_event(f"[RISCO] Erro ao verificar risco FTMO (agregador) para {_a}: {e}", level="error")
-                        # não bloqueia por falha; o check detalhado por-ativo acontece adiante
                         continue
                 bloqueios_status['risco_ftmo'] = not risco_ok_agg
             except Exception as e:
@@ -524,38 +553,58 @@ def main():
                     operou = True
                 continue
 
-            # --- BLOQUEIO LOSS FLUTUANTE (flag persistente) ---
+            # ======= LOSS FLUTUANTE =======
+            bloqueio_novas_entradas = False  # <- chave para SOFT
+            # --- BLOQUEIO FLUTUANTE (flag persistente) ---
             if esta_bloqueado_loss_flutuante():
-                _log_bloqueio("-", ciclo_num, "bloqueio_loss_flutuante")
-                log_event("Robô bloqueado por proteção de loss flutuante (simultâneo em aberto). Aguardando virar o dia para retomar.", level="warning")
-                try:
-                    enviar_telegram("⚠️ Robô em proteção: atingiu o limite de ordens abertas em prejuízo simultâneo. Só irá operar novamente amanhã.")
-                except Exception:
-                    pass
-                while esta_bloqueado_loss_flutuante():
-                    time.sleep(120)
-                log_event("Proteção de loss flutuante liberada, retomando operação.", level="info")
-                try:
-                    enviar_telegram("Robô liberado após proteção de loss flutuante. Retomando operação.")
-                except Exception:
-                    pass
-                continue
+                if modo_flut == "hard":
+                    _log_bloqueio("-", ciclo_num, "bloqueio_loss_flutuante(HARD)")
+                    log_event("Robô bloqueado por proteção de loss flutuante (HARD). Esperando virar o dia.", level="warning")
+                    try:
+                        enviar_telegram("⚠️ Robô em proteção (HARD): limite de ordens em prejuízo simultâneo. Aguardando amanhã.")
+                    except Exception:
+                        pass
+                    while esta_bloqueado_loss_flutuante():
+                        time.sleep(120)
+                    log_event("Proteção de loss flutuante liberada, retomando operação.", level="info")
+                    try:
+                        enviar_telegram("Robô liberado após proteção de loss flutuante. Retomando operação.")
+                    except Exception:
+                        pass
+                    continue
+                else:
+                    # SOFT: segue rodando, mas sem abrir novas entradas
+                    bloqueio_novas_entradas = True
+                    _log_bloqueio("-", ciclo_num, "bloqueio_loss_flutuante(SOFT)")
+                    log_event("Proteção SOFT ativa: novas ENTRADAS bloqueadas; gestão de posições continua.", level="warning")
 
-            # --- HARD STOP por loss flutuante (atingido agora) ---
+            # --- DISPARO FLUTUANTE (atingido agora) ---
             atingiu_flutuante, qtd_loss, tickets_loss = checar_loss_flutuante(ativos, max_ordens_loss_aberto)
             if atingiu_flutuante:
-                _log_bloqueio("-", ciclo_num, "hard_loss_flutuante", qtd_loss=qtd_loss, tickets=tickets_loss)
-                log_event(f"PROTEÇÃO ativada: {qtd_loss} ordens simultâneas abertas em prejuízo! Fechando todas e bloqueando robô.", level="critical")
-                try:
-                    enviar_telegram(f"🚨 PROTEÇÃO FLUTUANTE: {qtd_loss} ordens abertas em prejuízo! Todas serão fechadas e robô hibernado até amanhã.\nTickets: {tickets_loss}")
-                except Exception:
-                    pass
-                total_fechadas = fechar_todas_ordens(ativos, motivo="Fechamento automático por proteção de loss flutuante")
-                bloquear_loss_flutuante()
-                log_event(f"Total de ordens fechadas por proteção flutuante: {total_fechadas}", level="critical")
-                if total_fechadas > 0:
-                    operou = True
-                continue
+                if modo_flut == "hard":
+                    _log_bloqueio("-", ciclo_num, "hard_loss_flutuante", qtd_loss=qtd_loss, tickets=tickets_loss)
+                    log_event(f"PROTEÇÃO HARD: {qtd_loss} ordens negativas simultâneas! Fechando todas e bloqueando o dia.", level="critical")
+                    try:
+                        enviar_telegram(f"🚨 PROTEÇÃO FLUTUANTE (HARD): {qtd_loss} ordens em prejuízo! Fechando todas e hibernando até amanhã.\nTickets: {tickets_loss}")
+                    except Exception:
+                        pass
+                    total_fechadas = fechar_todas_ordens(ativos, motivo="Fechamento automático por proteção de loss flutuante (HARD)")
+                    bloquear_loss_flutuante()
+                    log_event(f"Total de ordens fechadas por proteção flutuante (HARD): {total_fechadas}", level="critical")
+                    if total_fechadas > 0:
+                        operou = True
+                    continue
+                else:
+                    # SOFT: não fecha, apenas bloqueia novas entradas
+                    _log_bloqueio("-", ciclo_num, "soft_loss_flutuante", qtd_loss=qtd_loss, tickets=tickets_loss)
+                    log_event(f"PROTEÇÃO SOFT: {qtd_loss} ordens negativas simultâneas. Bloqueando NOVAS entradas (ordens abertas permanecem).", level="warning")
+                    try:
+                        enviar_telegram(f"⚠️ PROTEÇÃO FLUTUANTE (SOFT): {qtd_loss} ordens em prejuízo — bloqueando NOVAS entradas. Tickets: {tickets_loss}")
+                    except Exception:
+                        pass
+                    bloquear_loss_flutuante()  # marca o dia como bloqueado (para entradas)
+                    bloqueio_novas_entradas = True
+                    # segue sem 'continue': gestão de posições permanece ativa
 
             # --- META DO DIA (gain/loss) ---
             atingiu_meta, tipo_meta, pct = atingiu_meta_periodo()
@@ -680,7 +729,6 @@ def main():
                             ciclo_info_log[f"{ativo}_status"] = "bloqueado_risco"
                             continue
                     except Exception as e:
-                        # Apenas loga o erro e segue — não bloqueia por falha de verificação
                         log_event(f"Erro ao verificar risco para {ativo}: {e} (CICLO {ciclo_num})", level="error")
 
                     # --- Contexto ---
@@ -769,6 +817,17 @@ def main():
                         ciclo_info_log[f"{ativo}_sinal"] = "neutro"
                         continue
 
+                    # === Gates de entrada: cooldown e proteção SOFT ===
+                    if em_cooldown:
+                        _log_bloqueio(ativo, ciclo_num, "cooldown_inicial", minutos=cooldown_minutos)
+                        log_event(f"[COOLDOWN] Sem novas entradas para {ativo} por {cooldown_minutos} minutos após o start.", level="info")
+                        continue
+
+                    if bloqueio_novas_entradas:
+                        _log_bloqueio(ativo, ciclo_num, "loss_flutuante_soft")
+                        log_event(f"[SOFT] Entrada bloqueada em {ativo} pelo modo SOFT de loss flutuante. Gestão continua.", level="info")
+                        continue
+
                     try:
                         sinal_int = normalizar_sinal(resultado_sinal["sinal"])
                         sinal_traduzido = sinal_to_str(sinal_int)
@@ -795,13 +854,11 @@ def main():
 
                         score_total = peso_padrao * score_padrao + peso_memoria * score_memoria
 
-                        # --- Preview TP/SL (forward) — agora "advisory": aplica penalidade ao score_total,
-                        # e só BLOQUEIA se (loss & confiança alta & N>=mínimo) ---
+                        # --- Preview TP/SL (forward) — "advisory"
                         tp_pips = config.get("tp_pips", 10)
                         sl_pips = config.get("sl_pips", 10)
                         pip_factor = get_pip_factor(config, ativo)
 
-                        # Prioridade intra-candle: usa a que veio do gerar_sinal(), senão cai para o config
                         prioridade_intracandle = str(
                             (resultado_sinal or {}).get("tp_sl_priority",
                                 config.get("tp_sl_intracandle_priority", "SL"))
@@ -818,15 +875,14 @@ def main():
                                 tp_pips=tp_pips,
                                 sl_pips=sl_pips,
                                 ponto_pip=pip_factor,
-                                prioridade_intracandle=prioridade_intracandle  # ⬅️ NOVO
+                                prioridade_intracandle=prioridade_intracandle
                             )
 
-                        # Penalidade "advisory" no score_total
                         score_total_ajust = score_total
                         if resultado_tp_sl == "loss":
                             score_total_ajust = max(-1.0, score_total - TP_SL_PENALTY)
 
-                        # --- FILTROS DE EXECUÇÃO (com motivo explícito) ---
+                        # --- FILTROS DE EXECUÇÃO ---
                         confianca_exec = float(resultado_sinal.get("confianca", 0.5))
                         aplica_limiar_por_n = (n_ocorrencias is not None and n_ocorrencias >= MIN_EVID_PADRAO)
 
@@ -850,7 +906,7 @@ def main():
                                 score_total=f"{score_total:.2f}",
                                 score_total_ajust=f"{score_total_ajust:.2f}",
                                 tp_sl_preview=resultado_tp_sl,
-                                tp_sl_prioridade=prioridade_intracandle,  # ⬅️ NOVO
+                                tp_sl_prioridade=prioridade_intracandle,
                                 confianca=confianca_exec
                             )
 
@@ -870,7 +926,7 @@ def main():
                                 "score_total": score_total,
                                 "score_total_ajust": score_total_ajust,
                                 "resultado_tp_sl": resultado_tp_sl,
-                                "tp_sl_prioridade": prioridade_intracandle,  # ⬅️ NOVO
+                                "tp_sl_prioridade": prioridade_intracandle,
                                 "sinal_aprovado": False
                             }
                             continue
@@ -913,8 +969,6 @@ def main():
                             "confianca": confianca_exec,
                             "mult_vies": mult_vies,
                             "volume_base": volume_base,
-                            # Se quiser que o lote também reflita o score_total ajustado, descomente:
-                            # "score_total": max(0.0, min(1.0, (score_total_ajust + 1.0) / 2.0)),
                         }
 
                         preco_abertura = candles_feat.iloc[-1]["close"]
@@ -926,7 +980,7 @@ def main():
                             except Exception:
                                 timestamp_inicio_candle = timestamp_execucao
 
-                        # Delay de execução (registrar com lote "auto" — quem define é o executor)
+                        # Delay de execução
                         log_delay_execucao(
                             timestamp_inicio_candle=timestamp_inicio_candle,
                             timestamp_execucao_ordem=timestamp_execucao,

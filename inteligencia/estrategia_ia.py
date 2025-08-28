@@ -1,4 +1,5 @@
 # inteligencia/estrategia_ia.py
+# (Adições não destrutivas: sanity de padrão, gates de contexto e de ensemble)
 import pandas as pd
 import numpy as np
 import os
@@ -30,10 +31,6 @@ MODELOS_CARREGADOS = {}
 # NOVO: meta-features (iguais às do treino) e listas .pkl
 # =========================================================
 def adicionar_meta_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Cria as MESMAS meta-features do treino SE houver colunas OHLC.
-    Se as colunas não existirem, retorna df ileso.
-    """
     df = df.copy()
     ok_close = "close" in df.columns
     ok_h = "high" in df.columns
@@ -43,14 +40,12 @@ def adicionar_meta_features(df: pd.DataFrame) -> pd.DataFrame:
         returns = df["close"].pct_change()
         df["volatility_20"] = returns.rolling(20).std()
         df["volatility_50"] = returns.rolling(50).std()
-        # força de tendência (coef. linear / desvio)
         df["trend_strength"] = df["close"].rolling(20).apply(
             lambda x: abs(np.polyfit(range(len(x)), x, 1)[0]) / np.std(x) if np.std(x) > 0 else 0,
             raw=False
         )
     if ok_close and ok_h and ok_l:
         roll_mean = df["close"].rolling(20).mean()
-        # evita divisão por zero
         roll_mean = roll_mean.replace(0, np.nan)
         df["range_ratio"] = (df["high"] - df["low"]) / roll_mean
         df["range_ratio"] = df["range_ratio"].fillna(0.0)
@@ -59,10 +54,6 @@ def adicionar_meta_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _load_feature_list(model_key: str):
-    """
-    Carrega lista de features usadas no treino (prioriza .pkl; tem fallback legado p/ XGB json).
-    model_key: 'random_forest' | 'xgboost' | 'lstm'
-    """
     pkl_map = {
         "random_forest": "modelos/features_treinadas_rf.pkl",
         "xgboost":       "modelos/features_treinadas_xgb.pkl",
@@ -78,7 +69,6 @@ def _load_feature_list(model_key: str):
         except Exception as e:
             log_event(f"[FEATURES] Falha ao carregar {pkl_path}: {e}", level="warning")
 
-    # Fallback legado só para XGB (se existir)
     if model_key == "xgboost":
         feats_path = "modelos/xgb_features.json"
         if os.path.exists(feats_path):
@@ -91,16 +81,13 @@ def _load_feature_list(model_key: str):
             except Exception as e:
                 log_event(f"[FEATURES] Falha ao ler {feats_path}: {e}", level="warning")
 
-    return None  # sem lista — vamos cair no comportamento numérico padrão
+    return None
 
 
 # ----------------------------
 # Config helpers
 # ----------------------------
 def _obter_cfg_modelos(config):
-    """
-    Compatibilidade: aceita tanto 'modelos_sinal' (preferido) quanto 'ensemble_modelos' (legado).
-    """
     modelos_cfg = config.get("modelos_sinal", None)
     if modelos_cfg is None:
         modelos_cfg = config.get("ensemble_modelos", {})
@@ -116,7 +103,6 @@ def _obter_cfg_modelos(config):
 
 
 def _read_params(config):
-    """Lê parâmetros usados na decisão/anti-neutro com defaults seguros."""
     return {
         "ensemble_voting": config.get("ensemble_voting", "majority"),  # majority|media|max
         "neutro_weight": float(config.get("neutro_weight", 0.50)),
@@ -130,7 +116,6 @@ def _read_params(config):
         "turbo_override_conf": float(config.get("turbo_override_conf", 0.80)),
         "turbo_requires_no_squeeze": bool(config.get("turbo_requires_no_squeeze", True)),
         "sniper_scoring_enable": bool(config.get("sniper_scoring_enable", False)),
-        # Para EV gate (usa tp/sl do config global)
         "tp_pips": float(config.get("tp_pips", 40)),
         "sl_pips": float(config.get("sl_pips", 20)),
         "ev_rule_enable": bool(config.get("ev_rule_enable", False)),
@@ -182,43 +167,32 @@ def carregar_modelos(config):
 # Pré-processamento (alinha features às do treino)
 # ----------------------------
 def preprocessar_features(df, nome_modelo):
-    """
-    - opcionalmente adiciona meta-features (usar_meta_features no config; default True)
-    - reindexa pelas listas de features salvas (.pkl) do modelo
-    - trata NaN/inf e garante float32
-    Retorna: {"X": np.ndarray(1,n), "features_treinadas": list|None, "df_alinhado": pd.DataFrame(1,n)}
-    """
     try:
         cfg = carregar_config()
         usar_meta = bool(cfg.get("usar_meta_features", True))
         df_work = df.copy()
 
-        # 1) meta-features (se habilitado)
         if usar_meta:
             try:
                 df_work = adicionar_meta_features(df_work)
             except Exception as e:
                 log_event(f"[PREP] adicionar_meta_features falhou: {e}", level="warning")
 
-        # 2) escolher lista de features do modelo
         feats = _load_feature_list(nome_modelo)
 
-        # 3) alinhar
         df_num = df_work.select_dtypes(include=[np.number, "bool"])
         if feats:
             df_align = df_num.reindex(columns=feats)
         else:
-            # sem lista: usa numéricas como você já fazia
             df_align = df_num
 
-        # 4) tail(1) + limpeza (ffill/bfill compatível com novas versões do pandas)
-        df_align = df_align.tail(1).copy()
         df_align = (
-            df_align.ffill()
-                    .bfill()
-                    .fillna(0.0)
-                    .replace([np.inf, -np.inf], 0.0)
-                    .astype(np.float32)
+            df_align.tail(1).copy()
+                   .ffill()
+                   .bfill()
+                   .fillna(0.0)
+                   .replace([np.inf, -np.inf], 0.0)
+                   .astype(np.float32)
         )
         X = df_align.values
         return {"X": X, "features_treinadas": feats, "df_alinhado": df_align}
@@ -246,7 +220,6 @@ def predict_model(modelo, tipo, X):
 
     elif tipo == "lstm" and keras:
         try:
-            # GARANTE SHAPE 3D (batch, timesteps=1, features)
             X_use = X
             if X_use.ndim == 2:
                 X_use = X_use.reshape((X_use.shape[0], 1, X_use.shape[1]))
@@ -257,7 +230,6 @@ def predict_model(modelo, tipo, X):
                 pred_label = int(np.argmax(pred))
                 conf = float(np.max(pred))
             else:
-                # caso raro: saída escalar
                 pred_label = int(np.round(float(pred)))
                 conf = float(abs(float(pred)))
             return int(normalizar_sinal(pred_label)), conf, "LSTM"
@@ -288,21 +260,11 @@ def predict_model(modelo, tipo, X):
 # Agregação + Anti-neutro
 # ----------------------------
 def _agregar_votos(votos, params):
-    """
-    votos: lista de dicts:
-      { "modelo": "XGBoost"/"RandomForest"/"LSTM",
-        "nome_key": "xgboost"/"random_forest"/"lstm",
-        "sinal": int(-1/0/1), "conf": float, "conf_eff": float }
-    Retorna: sinal_ensemble (int), score_media_pesada (float), conf_media (float),
-             melhor_non_neutro: (sinal, conf, modelo), conf_neutro_max_eff (float)
-    """
     if not votos:
         return 0, 0.0, 0.0, (-1, 0.0, None), 0.0
 
-    # média de confiança "bruta"
     conf_media = float(np.mean([v["conf"] for v in votos]))
 
-    # média pesada por confiança (reduzindo peso do 0)
     soma = 0.0
     peso = 0.0
     conf_neutro_max_eff = 0.0
@@ -315,7 +277,7 @@ def _agregar_votos(votos, params):
 
         if s == 0:
             conf_neutro_max_eff = max(conf_neutro_max_eff, c_eff)
-            c_eff *= (1.0 - float(params.get("neutro_weight", 0.50)))  # rebaixa neutro
+            c_eff *= (1.0 - float(params.get("neutro_weight", 0.50)))
         soma += (s * c_eff)
         peso += abs(c_eff)
 
@@ -324,7 +286,6 @@ def _agregar_votos(votos, params):
 
     score_media_pesada = (soma / peso) if peso > 0 else 0.0
     if params.get("ensemble_voting", "majority") == "max":
-        # escolhe voto não-neutro de maior confiança; se todos neutros, neutro com maior conf
         nao_neutros = [v for v in votos if int(normalizar_sinal(v.get("sinal", 0))) != 0]
         if nao_neutros:
             vbest = max(nao_neutros, key=lambda v: float(v.get("conf", 0.0)))
@@ -332,7 +293,6 @@ def _agregar_votos(votos, params):
         vbest = max(votos, key=lambda v: float(v.get("conf", 0.0)))
         return 0, float(vbest.get("conf", 0.0)), conf_media, melhor_non_neutro, conf_neutro_max_eff
 
-    # majority/media: discretiza score_media_pesada
     if score_media_pesada > 0:
         sinal_ensemble = 1
     elif score_media_pesada < 0:
@@ -427,11 +387,36 @@ def gerar_sinal(df_candles, ativo, contexto=None):
         except Exception as _e:
             log_event(f"[THRESHOLDS] Falha ao carregar thresholds: {_e}", level="warning")
 
+    # ---- NOVO: filtros/gates do config (defaults seguros) ----
+    filtros = (config.get("filtros", {}) if isinstance(config, dict) else {}) or {}
+    banir_squeeze = bool(filtros.get("banir_squeeze", True))
+    banir_vol_baixa = bool(filtros.get("banir_vol_baixa", True))
+    consenso_min = int(filtros.get("consenso_min", 2))
+    prob_min_abs = float(filtros.get("prob_min_absoluto", 0.62))
+    margem_neutro = float(filtros.get("margem_neutro", 0.05))
+
+    # helper de retorno neutro padronizado
+    def _saida_neutra(motivo_extra: str):
+        contexto_decisao["motivo"] = (contexto_decisao.get("motivo", "") + f" | {motivo_extra}").strip(" |")
+        saida_local = {
+            "timestamp": df["timestamp"].iloc[-1] if "timestamp" in df.columns else "",
+            "sinal": 0,
+            "padrao": contexto_decisao.get("padrao"),
+            "motivo": contexto_decisao["motivo"],
+            "confianca": contexto_decisao.get("confianca", 0.5),
+            "regime": contexto_decisao.get("regime", "neutro"),
+            "contexto": contexto_decisao,
+            "tp_sl_priority": "SL",
+        }
+        sanity_check_sinal(saida_local)
+        return saida_local
+
     contexto_decisao = {
         "padrao": None,
         "confianca": 0.5,
         "regime": contexto.get("regime", "neutro") if contexto else "neutro",
         "squeeze": contexto.get("squeeze", False) if contexto else False,
+        "volatilidade": (contexto.get("volatilidade") if isinstance(contexto, dict) else None),
         "motivo": "",
         "padrao_score": 0.0,
     }
@@ -444,6 +429,28 @@ def gerar_sinal(df_candles, ativo, contexto=None):
         contexto_decisao["padrao"], contexto_decisao["padrao_score"] = obter_score_padrao(df.tail(50))
     except Exception as e:
         log_event(f"[PADRAO] não foi possível calcular: {e}", level="warning")
+
+    # ---- NOVO: SANITY de padrão (bloqueante) ----
+    try:
+        ps = contexto_decisao.get("padrao_score", None)
+        if (contexto_decisao.get("padrao") is None) or (ps is None) or (isinstance(ps, float) and np.isnan(ps)):
+            log_event("[GATE] NEUTRO — padrao_invalido", level="info")
+            return _saida_neutra("padrao_invalido")
+    except Exception as _e:
+        log_event(f"[GATE] erro ao validar padrao: {_e}", level="warning")
+        return _saida_neutra("padrao_invalido")
+
+    # ---- NOVO: GATES de contexto (squeeze/volatilidade) ----
+    try:
+        if banir_squeeze and bool(contexto_decisao.get("squeeze", False)):
+            log_event("[GATE] NEUTRO — squeeze_ativo", level="info")
+            return _saida_neutra("squeeze")
+        vol = str(contexto_decisao.get("volatilidade", "")).lower()
+        if banir_vol_baixa and vol == "baixa":
+            log_event("[GATE] NEUTRO — volatilidade_baixa", level="info")
+            return _saida_neutra("volatilidade_baixa")
+    except Exception as _e:
+        log_event(f"[GATE] erro nos gates de contexto: {_e}", level="warning")
 
     # Para cada modelo configurado e carregado
     for nome, info in modelos_cfg.items():
@@ -465,7 +472,6 @@ def gerar_sinal(df_candles, ativo, contexto=None):
             if nome == "xgboost" and xgb:
                 pred, conf = _predict_xgb_com_nomes(df_feat_alinhado, feats, "modelos/xgb_cerebro.json")
                 modelo_nome = "XGBoost"
-
             elif nome == "random_forest":
                 pred_label = int(modelo.predict(df_feat_alinhado)[0])
                 try:
@@ -474,14 +480,12 @@ def gerar_sinal(df_candles, ativo, contexto=None):
                     conf = 0.5
                 pred = int(normalizar_sinal(pred_label))
                 modelo_nome = "RandomForest"
-
             else:
                 pred, conf, modelo_nome = predict_model(modelo, nome, X)
 
             s = int(normalizar_sinal(pred))
             conf_raw = float(conf)
 
-            # Aplica caps/pesos para efeito no ensemble (não altera conf_raw)
             conf_eff = conf_raw
             if s == 0:
                 if "xgb" in nome.lower() or "xgboost" in modelo_nome.lower():
@@ -501,7 +505,6 @@ def gerar_sinal(df_candles, ativo, contexto=None):
             motivos.append(f"{nome}:ERRO({e})")
             log_event(f"[GERAR_SINAL] Erro ao prever com {nome}: {e}", level="error")
 
-    # Se não houve votos válidos → fallback
     if not votos:
         log_event(f"Nenhuma previsão válida dos modelos (motivos: {';'.join(motivos) if motivos else '—'}). Usando fallback técnico.", level="warning")
         return fallback_tecnico(df, contexto_decisao)
@@ -519,13 +522,34 @@ def gerar_sinal(df_candles, ativo, contexto=None):
     # Agregação
     sinal_final, score_media_pesada, conf_media, melhor_non_neutro, conf_neutro_max_eff = _agregar_votos(votos, P)
 
+    # ---- NOVO: GATES do ensemble (antes de promoções) ----
+    if sinal_final != 0:
+        try:
+            total = len(votos)
+            votos_lado = sum(1 for v in votos if int(v["sinal"]) == int(sinal_final))
+            votos_pos = sum(1 for v in votos if int(v["sinal"]) == 1)
+            votos_neg = sum(1 for v in votos if int(v["sinal"]) == -1)
+            frac = abs((votos_pos - votos_neg)) / max(1, total)
+
+            if votos_lado < consenso_min:
+                log_event(f"[GATE] NEUTRO — consenso({votos_lado})<{consenso_min}", level="info")
+                return _saida_neutra("consenso_insuficiente")
+            if conf_media < prob_min_abs:
+                log_event(f"[GATE] NEUTRO — conf_media {conf_media:.3f}<{prob_min_abs:.2f}", level="info")
+                return _saida_neutra("prob_baixa")
+            if frac < margem_neutro:
+                log_event(f"[GATE] NEUTRO — margem {frac:.3f}<{margem_neutro:.2f}", level="info")
+                return _saida_neutra("margem_neutro")
+        except Exception as _e:
+            log_event(f"[GATE] erro ao checar gates do ensemble: {_e}", level="warning")
+
     # Turbo override (se existir um voto com conf muito alta e sem squeeze, prioriza)
     if bool(P.get("turbo_override_enable", True)) and contexto_decisao.get("squeeze", False) is False:
         if melhor_non_neutro[1] >= float(P.get("turbo_override_conf", 0.80)):
             log_event(f"[TURBO] override por conf alta do melhor não-neutro ({melhor_non_neutro[1]:.3f}).", level="info")
             sinal_final = int(melhor_non_neutro[0])
 
-    # Regras 2x1 por confiança (se 2 modelos concordam com conf >= ensemble_min_conf)
+    # Regras 2x1 por confiança
     if bool(P.get("ensemble_2x1_conf", True)) and sinal_final == 0:
         lado_pos = sum(1 for v in votos if int(v['sinal']) == 1 and float(v['conf']) >= float(P.get("ensemble_min_conf", 0.70)))
         lado_neg = sum(1 for v in votos if int(v['sinal']) == -1 and float(v['conf']) >= float(P.get("ensemble_min_conf", 0.70)))
@@ -551,37 +575,31 @@ def gerar_sinal(df_candles, ativo, contexto=None):
             sniper_ok = detectar_sniper(df, ativo, contexto=contexto or {}, regime=regime_for_sniper)
         except Exception as e:
             log_event(f"[SNIPER] Erro no gate: {e}", level="error")
-            sniper_ok = True  # não bloqueia em caso de erro
+            sniper_ok = True
         if not sniper_ok:
-            motivos.append("SNIPER:BLOCK")
             log_event(f"[SNIPER] bloqueou entrada em {ativo} (sem confluência).", level="info")
-            sinal_final = 0
-        else:
-            motivos.append("SNIPER:OK")
+            return _saida_neutra("sniper_block")
 
-    # ## EV gate (final, opcional) — aplica no resultado antes do retorno
+    # ## EV gate (final, opcional)
     if bool(P.get('ev_rule_enable', False)) and sinal_final != 0:
         try:
             probas = contexto_decisao.get('probas', {}) if isinstance(contexto_decisao, dict) else {}
-            # aceita chaves '+1'/'-1' ou 1/-1
             p_plus = float(probas.get('+1', probas.get(1, float('nan'))))
             p_minus = float(probas.get('-1', probas.get(-1, float('nan'))))
             def _ev_pips_local(p_plus, p_minus, tp, sl):
                 ev_long = p_plus*tp - p_minus*sl
                 ev_short = p_minus*tp - p_plus*sl
                 return ev_long, ev_short
-            if p_plus == p_plus and p_minus == p_minus:  # not NaN
+            if p_plus == p_plus and p_minus == p_minus:
                 ev_long, ev_short = _ev_pips_local(p_plus, p_minus, float(P.get('tp_pips', 40)), float(P.get('sl_pips', 20)))
                 ev_min = float(P.get('ev_min_pips', 1.0))
                 ev_side = ev_long if sinal_final == 1 else ev_short
                 if ev_side < ev_min:
                     log_event(f"[EV] bloqueado | EV={ev_side:.2f} < {ev_min:.2f} (p+={p_plus:.2f}, p-={p_minus:.2f})", level='info')
-                    sinal_final = 0
-                    contexto_decisao['motivo'] = (contexto_decisao.get('motivo','') + ' | ev_block').strip(' |')
+                    return _saida_neutra("ev_block")
         except Exception as _e:
             log_event(f"[EV] erro no gate: {_e}", level='warning')
 
-    # --- Monta motivo/padrão e (apenas) anota score de reforço ---
     padrao_nome = "|".join([f"{v['modelo']}:{v['sinal']}" for v in votos])
     try:
         contexto_decisao["confianca"] = float(conf_media)
@@ -640,7 +658,7 @@ def _sniper_score(contexto, pesos):
         t = bool(contexto.get('tendencia_ok', False))
         v = bool(contexto.get('vol_ok', False)) or (str(contexto.get('volatilidade','')).lower() in ('media','alta'))
         ns = not bool(contexto.get('squeeze', False))
-        sp = bool(contexto.get('spread_ok', True))  # assume ok se não tiver
+        sp = bool(contexto.get('spread_ok', True))
         score = (pesos.get('tendencia',1.0)*(1 if t else 0) +
                  pesos.get('vol_ok',1.0)*(1 if v else 0) +
                  pesos.get('no_squeeze',1.0)*(1 if ns else 0) +
@@ -651,11 +669,9 @@ def _sniper_score(contexto, pesos):
         return 0.0, 4.0
 
 
-# --- XGB helper (com nomes de colunas) ---
 def _predict_xgb_com_nomes(df_feat_alinhado, feats, caminho_modelo):
     if xgb is None:
         raise RuntimeError("XGBoost não disponível")
-    # usa as colunas do df_alinhado (já reindexadas na ordem certa)
     if feats is None:
         X = df_feat_alinhado.values
         feat_names = list(df_feat_alinhado.columns)
